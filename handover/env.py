@@ -30,6 +30,7 @@ import numpy as np
 from gymnasium import spaces
 
 from .contacts import GIVER, RECV, ContactRegistry, load_fraction
+from .dq import pose_distance
 from .control import BimanualController, ControlConfig
 from .grasp import POCKET_BODY_LEFT, POCKET_BODY_RIGHT
 from .scene import (
@@ -99,6 +100,14 @@ class EnvConfig:
     # the sum matters, and the potential form means raising it cannot reintroduce
     # a survival penalty.
     w_approach: float = 20.0
+
+    # "dq"        : dual-quaternion pose distance, combining translation and
+    #               orientation. Reproduces the baseline paper's headline
+    #               contribution and is the default.
+    # "euclidean" : position only, ignoring how the hand is oriented when it
+    #               arrives. Kept so the two can be compared directly, which is
+    #               the comparison the baseline paper makes.
+    approach_metric: str = "dq"
 
     # ---- optional reward terms, all OFF by default ----
     #
@@ -174,6 +183,14 @@ class EnvConfig:
     # standing still, which is safe and scores about 22. A snapshot is cached per
     # entry, so this costs a one-off build rather than per-episode work.
     start_distance_mix: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
+
+    # Pre-grasp standoff along the palm's -z. Closest start sits here rather
+    # than on the object itself.
+    # 0.0 reproduces the measured-best configuration. Raising it moves the
+    # closest start off the object, which is geometrically tidier but measured
+    # WORSE end to end (0/5 expert successes vs 2/5), so it is left off pending
+    # a proper sweep rather than adopted on the strength of the argument.
+    pregrasp_standoff: float = 0.0
 
     # Whether to put the privileged critic state in the info dict. Off for the
     # single-agent baseline, which does not use it: the array is shipped across
@@ -306,11 +323,24 @@ class HandoverEnv(gym.Env):
         self.data.qvel[self.object_dof : self.object_dof + 6] = 0.0
 
     def _recv_grasp_palm(self) -> np.ndarray:
-        """Palm position that would put the receiver's pocket on the object."""
+        """Nearest sane start: the PRE-GRASP standoff, not the grasp pose itself.
+
+        The pocket offset is measured at full closure, but a hand approaching an
+        episode start is open, and its fingertips stick out along the palm's +z.
+        Interpolating start positions toward the exact grasp pose therefore puts
+        the closest starts with their open fingers already inside the object,
+        which knocks it loose within ~15 steps. Backing off along the palm's -z
+        keeps every start on a clean approach line.
+        """
         obj = np.asarray(self.scene_cfg.obj_init_pos, dtype=float)
         mat = np.zeros(9)
         mujoco.mju_quat2Mat(mat, np.asarray(self.scene_cfg.recv_start_quat, dtype=float))
-        return obj - mat.reshape(3, 3) @ np.asarray(POCKET_BODY_LEFT, dtype=float)
+        rot = mat.reshape(3, 3)
+        return (
+            obj
+            - rot @ np.asarray(POCKET_BODY_LEFT, dtype=float)
+            - self.cfg.pregrasp_standoff * rot[:, 2]
+        )
 
     def _grip_point(self, side: str) -> np.ndarray:
         """World position of a hand's grasp pocket, given its current palm pose."""
@@ -398,11 +428,31 @@ class HandoverEnv(gym.Env):
 
     # ---------------------------------------------------------------- reward
 
+    def _grasp_target(self) -> tuple[np.ndarray, np.ndarray]:
+        """Pose the receiver's palm must reach to grasp the object where it is."""
+        obj_pos, _ = self._object_pose()
+        quat = np.asarray(self.scene_cfg.recv_start_quat, dtype=float)
+        mat = np.zeros(9)
+        mujoco.mju_quat2Mat(mat, quat)
+        return obj_pos - mat.reshape(3, 3) @ np.asarray(POCKET_BODY_LEFT, dtype=float), quat
+
+    def approach_error(self) -> tuple[float, float, float]:
+        """(total, translation, rotation) error to the receiver's grasp pose."""
+        palm_pos, palm_quat = self.controller.arms[RECV].palm_pose(self.data)
+        target_pos, target_quat = self._grasp_target()
+        if self.cfg.approach_metric == "euclidean":
+            translation = float(np.linalg.norm(target_pos - palm_pos))
+            return translation, translation, 0.0
+        return pose_distance(palm_pos, palm_quat, target_pos, target_quat)
+
     def _potential(self, obj_pos: np.ndarray) -> float:
-        """Shaping potential: closer receiver is better."""
-        return -self.cfg.w_approach * float(
-            np.linalg.norm(self._grip_point(RECV) - obj_pos)
-        )
+        """Shaping potential: closer to the grasp POSE is better.
+
+        Position alone leaves the hand's orientation unconstrained, so a policy
+        can arrive at the right point facing the wrong way and never grasp.
+        Under "dq" this is the baseline's combined pose metric.
+        """
+        return -self.cfg.w_approach * self.approach_error()[0]
 
     def _palm_speed(self, side: str) -> float:
         """Linear speed of one hand's palm, in world coordinates."""
@@ -656,7 +706,9 @@ class HandoverEnv(gym.Env):
             "giver_load_z": wrenches[GIVER].load_vertical,
             "recv_load_z": wrenches[RECV].load_vertical,
             "object_height": float(obj_pos[2]),
-            "approach_dist": float(np.linalg.norm(self._grip_point(RECV) - obj_pos)),
+            "approach_dist": self.approach_error()[0],
+            "approach_trans": self.approach_error()[1],
+            "approach_rot": self.approach_error()[2],
             "success": bool(held),
             "dropped": dropped,
             "hold_count": self._hold_count,
