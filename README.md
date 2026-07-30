@@ -13,11 +13,32 @@ the handing robot"* — is what this implements.
 
 ## Setup on the server
 
+**Python 3.10 or newer is required.** On an HPC login node the default
+`python3` is often 3.6-3.9, so load a module first:
+
 ```bash
-python -m venv .venv
-./.venv/bin/pip install mujoco numpy gymnasium stable-baselines3 tensorboard wandb
+module spider Python           # find what your site provides
+module load Python/3.11.3      # or whatever it lists
+python3 -V                     # must be >= 3.10
+```
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip setuptools wheel
+.venv/bin/pip install --only-binary=:all: -r requirements.txt
 git clone --depth 1 https://github.com/google-deepmind/mujoco_menagerie.git ~/mujoco_menagerie
 ```
+
+Upgrading pip **before** installing anything is not optional: a pip older than
+~22 cannot match modern manylinux wheel tags, silently falls back to compiling
+MuJoCo from C source, and then dies on a missing `MUJOCO_PATH`. If you ever see
+`Building wheel for mujoco`, stop and fix the interpreter or pip rather than
+chasing the compiler error. `--only-binary=:all:` makes that failure loud
+instead of silent.
+
+Whatever `module load` line you needed, add it to `slurm/train.sbatch` before
+the `cd "$PROJECT_DIR"` line -- compute nodes do not inherit login-shell
+modules, so the job will otherwise fail at `import mujoco`.
 
 No Omniverse, no container, no GPU. Everything is CPU: MuJoCo steps on CPU and
 the policy is a small MLP, so workers scale with cores.

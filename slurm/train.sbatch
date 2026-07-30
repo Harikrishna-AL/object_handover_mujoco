@@ -30,6 +30,11 @@ TIMESTEPS="${TIMESTEPS:-20000000}"
 GIVER_MODE="${GIVER_MODE:-scripted}"
 # ----------------------------------------------------------------------------
 
+# Compute nodes do not inherit login-shell modules. If you needed a module to
+# get Python 3.10+ interactively, uncomment and set it here or the job will die
+# at `import mujoco`.
+# module load Python/3.11.3
+
 cd "$PROJECT_DIR"
 mkdir -p slurm_logs runs
 

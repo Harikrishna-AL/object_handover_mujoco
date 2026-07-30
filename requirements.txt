@@ -1,0 +1,30 @@
+# Requires Python >= 3.10.
+#
+# Two hard constraints, both learned the hard way on a cluster login node:
+#
+#   Python 3.10+   gymnasium 1.x needs it, and there is no prebuilt MuJoCo wheel
+#                  for 3.9. Without a wheel pip falls back to compiling MuJoCo
+#                  from C source, which then fails on a missing MUJOCO_PATH.
+#                  If you ever see "Building wheel for mujoco", stop: the
+#                  interpreter is wrong, or pip is too old to match the wheel
+#                  tags. Upgrade pip BEFORE installing anything else.
+#
+#   mujoco >= 3.11 The scene is composed with the MjSpec API (MjSpec.from_file,
+#                  spec.attach with a frame or site, add_actuator with explicit
+#                  gaintype/biastype). Earlier releases either lack these or
+#                  spell them differently.
+#
+# Install with:
+#   python3 -m venv .venv
+#   .venv/bin/python -m pip install --upgrade pip setuptools wheel
+#   .venv/bin/pip install --only-binary=:all: -r requirements.txt
+#
+# --only-binary=:all: makes a missing wheel fail loudly instead of silently
+# starting a source build.
+
+mujoco>=3.11,<4
+numpy>=1.26
+gymnasium>=1.0,<2
+stable-baselines3>=2.3
+tensorboard>=2.15
+wandb>=0.17
