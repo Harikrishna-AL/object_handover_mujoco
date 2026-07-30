@@ -159,6 +159,21 @@ WANDB_MODE=offline sbatch slurm/train.sbatch --wandb
 wandb sync wandb/offline-run-*      # later, from a node with network
 ```
 
+## Watching it
+
+```bash
+python scripts/record.py --policy expert --start-distance 0.25 --out handover.mp4
+python scripts/record.py --policy checkpoint --checkpoint runs/baseline/final.zip
+```
+
+Load fraction, both grip forces and object height are burned into each frame.
+Camera is adjustable with `--azimuth --elevation --distance`.
+
+Rendering needs a GL backend. It works out of the box on a laptop; on a
+headless node try `MUJOCO_GL=egl`, and if the build lacks EGL just record
+locally -- nothing in training renders, so this is a debugging tool rather than
+part of a run.
+
 ## Validation gates
 
 | script | checks |

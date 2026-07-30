@@ -112,6 +112,10 @@ class SceneConfig:
     timestep: float = 0.002
     impratio: float = 10.0
 
+    # Offscreen render buffer, used only by scripts/record.py.
+    offscreen_width: int = 1280
+    offscreen_height: int = 960
+
 
 def _strip_keyframes(spec: mujoco.MjSpec) -> None:
     """Remove child keyframes; their qpos widths do not survive attachment."""
@@ -157,6 +161,12 @@ def build_spec(cfg: SceneConfig | None = None, hands_only: bool = False) -> mujo
     world.option.impratio = cfg.impratio
     world.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
     world.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+
+    # Offscreen framebuffer for scripts/record.py. MuJoCo caps offscreen renders
+    # at 640x480 unless the model declares a larger buffer, and the failure is
+    # opaque -- the renderer just refuses.
+    world.visual.global_.offwidth = cfg.offscreen_width
+    world.visual.global_.offheight = cfg.offscreen_height
 
     # --- ground and lighting ---
     world.add_texture(

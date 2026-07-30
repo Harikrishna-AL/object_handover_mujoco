@@ -33,6 +33,7 @@ runs/
 wandb/
 checkpoints/
 *.mp4
+handover*.mp4
 *.gif
 
 # --- OS / editors ---
