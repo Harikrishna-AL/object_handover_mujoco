@@ -28,10 +28,44 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor, VecNorma
 from handover.env import DomainRandomization, EnvConfig, HandoverEnv
 
 
-def make_env(seed: int, randomize: bool, giver_mode: str):
+# Optional reward terms, mirroring the Isaac flag names so runs stay comparable.
+# With none of these set the reward is exactly the baseline.
+REWARD_FLAGS = [
+    "use_motion_penalty",
+    "use_deadlock_penalty",
+    "vel_rew",
+    "use_force_rewards",
+    "use_signal_1",
+    "use_signal_2",
+    "use_signal_instability",
+]
+
+REWARD_SCALARS = [
+    "v_min", "lambda_vel", "k_decay",
+    "F_ref", "F_safe", "F_threshold",
+    "lambda_firmness", "lambda_balance", "lambda_instability",
+    "lambda_force_excess", "palm_weight",
+]
+
+
+def add_reward_args(ap: argparse.ArgumentParser) -> None:
+    for flag in REWARD_FLAGS:
+        ap.add_argument(f"--{flag}", action="store_true", default=False)
+    defaults = EnvConfig()
+    for name in REWARD_SCALARS:
+        ap.add_argument(f"--{name}", type=float, default=getattr(defaults, name))
+
+
+def env_config_from_args(args, giver_mode: str) -> EnvConfig:
+    overrides = {f: getattr(args, f) for f in REWARD_FLAGS}
+    overrides.update({n: getattr(args, n) for n in REWARD_SCALARS})
+    return EnvConfig(giver_mode=giver_mode, **overrides)
+
+
+def make_env(seed: int, randomize: bool, env_cfg: EnvConfig):
     def _init():
         env = HandoverEnv(
-            EnvConfig(giver_mode=giver_mode),
+            env_cfg,
             randomization=DomainRandomization(enabled=randomize),
             seed=seed,
         )
@@ -106,12 +140,17 @@ def main():
                     help="stage 1 uses 'scripted'; stage 2 unfreezes the giver")
     ap.add_argument("--init-from", type=str, default=None,
                     help="checkpoint to warm-start from (for stage 2)")
+    add_reward_args(ap)
     args = ap.parse_args()
+
+    env_cfg = env_config_from_args(args, args.giver_mode)
+    active = [f for f in REWARD_FLAGS if getattr(args, f)]
+    print("reward: baseline" + (f" + {', '.join(active)}" if active else " only (no flags)"))
 
     os.makedirs(args.out, exist_ok=True)
 
     venv = SubprocVecEnv(
-        [make_env(args.seed + i, not args.no_dr, args.giver_mode) for i in range(args.n_envs)],
+        [make_env(args.seed + i, not args.no_dr, env_cfg) for i in range(args.n_envs)],
         start_method="spawn",
     )
     venv = VecMonitor(venv)

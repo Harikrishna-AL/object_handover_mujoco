@@ -99,9 +99,46 @@ class EnvConfig:
     # the sum matters, and the potential form means raising it cannot reintroduce
     # a survival penalty.
     w_approach: float = 20.0
+
+    # ---- optional reward terms, all OFF by default ----
+    #
+    # Same structure as the Isaac environment: with no flags set the reward is
+    # exactly the baseline, and each addition is attributable to one switch.
+    #
+    # NOTE ON CONSTANTS. The Isaac values (F_ref=0.15, F_safe=0.35,
+    # F_threshold=0.10) were measured against that environment's summed filtered
+    # contact forces. MuJoCo reports real newtons -- grips here run 9-33 N -- so
+    # those numbers are ~100x too small and are NOT carried over. The values
+    # below are set from the measured regime in this scene.
+    use_motion_penalty: bool = False
     w_object_motion: float = 0.4
-    w_excess_force: float = 0.5
+
+    use_deadlock_penalty: bool = False
     w_deadlock: float = 0.02
+
+    # Velocity penalty near the object (Isaac: --vel_rew).
+    vel_rew: bool = False
+    v_min: float = 0.1
+    lambda_vel: float = 5.0
+    k_decay: float = 13.0
+
+    # Force-based signals (Isaac: --use_force_rewards and the three signals).
+    use_force_rewards: bool = False
+    use_signal_1: bool = False
+    use_signal_2: bool = False
+    use_signal_instability: bool = False
+
+    # Force constants, in newtons, from this scene's measured regime:
+    # a sound grasp sits near 9 N (receiver) to 33 N (giver at full closure).
+    F_ref: float = 10.0
+    F_safe: float = 45.0
+    F_threshold: float = 2.0
+
+    lambda_firmness: float = 0.05
+    lambda_balance: float = 0.1
+    lambda_instability: float = 0.01
+    lambda_force_excess: float = 0.5
+    palm_weight: float = 0.3
     # Discount used inside the shaping term. Deliberately 1.0, not the learner's
     # 0.99: with gamma*phi(s') - phi(s) and a negative potential, the stationary
     # term is (gamma-1)*phi, which is POSITIVE and pays an agent ~0.06 per step
@@ -110,12 +147,6 @@ class EnvConfig:
     # phi(end) - phi(start), so standing still is worth zero and only real
     # progress pays.
     shaping_gamma: float = 1.0
-
-    # Grip force above which we start calling it crushing, in newtons. A full
-    # closure on this object already sits near 33 N, so a lower threshold would
-    # charge the giver for holding on normally. Measured
-    # regime from the kill test: a sound grasp on this object sits at 5-15 N.
-    grip_safe: float = 45.0
 
     # Both hands holding is the point of a handover, but only briefly; this
     # starts charging for it once the receiver has clearly taken the load.
@@ -216,6 +247,8 @@ class HandoverEnv(gym.Env):
         self._hold_count = 0
         self._prev_fraction = 0.0
         self._prev_potential = 0.0
+        self._prev_contacts = {GIVER: 0, RECV: 0}
+        self._prev_grip = {GIVER: 0.0, RECV: 0.0}
 
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.controller.action_dim,), dtype=np.float32
@@ -371,53 +404,117 @@ class HandoverEnv(gym.Env):
             np.linalg.norm(self._grip_point(RECV) - obj_pos)
         )
 
+    def _palm_speed(self, side: str) -> float:
+        """Linear speed of one hand's palm, in world coordinates."""
+        vel = np.zeros(6)
+        mujoco.mj_objectVelocity(
+            self.model,
+            self.data,
+            mujoco.mjtObj.mjOBJ_BODY,
+            self.controller.arms[side].body_id,
+            vel,
+            0,  # world frame
+        )
+        return float(np.linalg.norm(vel[3:6]))
+
     def _reward(self, wrenches, fraction: float) -> tuple[float, dict]:
+        """Baseline reward, plus whatever optional terms are switched on.
+
+        Structured the same way as the Isaac environment: everything outside the
+        baseline is behind its own flag and contributes exactly zero when off, so
+        `--` with no reward flags reproduces the baseline bit for bit and each
+        addition can be attributed to the flag that introduced it.
+        """
         cfg = self.cfg
         obj_pos, _ = self._object_pose()
+        terms: dict[str, float] = {}
 
-        # Team term: progress along the transfer. Rewarding the increase rather
-        # than the level keeps the policy from parking at a comfortable split.
+        # ================= BASELINE (always on) =================
+
+        # Progress along the transfer. Rewarding the increase rather than the
+        # level keeps the policy from parking at a comfortable split.
         progress = float(np.clip(fraction, 0.0, 1.0) - np.clip(self._prev_fraction, 0.0, 1.0))
-        r_progress = cfg.w_progress * progress
+        terms["r_progress"] = cfg.w_progress * progress
 
-        # Per-agent shaping, potential-based: gamma*phi(s') - phi(s).
+        # Approach shaping, potential-based: gamma*phi(s') - phi(s).
         #
         # A plain -w*distance term is charged every step, so merely staying alive
         # costs ~180 over a full episode while dropping the object at step 28
         # costs ~33. Training duly discovered that dropping scores better than
-        # persisting. Potential-based shaping telescopes away over an episode, so
-        # it cannot create that incentive, and it provably leaves the optimal
-        # policy unchanged (Ng, Harada & Russell 1999).
+        # persisting. The potential form telescopes, so it cannot create that
+        # incentive, and it leaves the optimal policy unchanged (Ng, Harada &
+        # Russell 1999).
         potential = self._potential(obj_pos)
-        r_approach = cfg.shaping_gamma * potential - self._prev_potential
+        terms["r_approach"] = cfg.shaping_gamma * potential - self._prev_potential
         self._prev_potential = potential
 
-        # Charged per step, but zero for a still object, so it cannot punish
-        # survival the way an unconditional distance term does.
-        obj_speed = float(np.linalg.norm(self.data.qvel[self.object_dof : self.object_dof + 3]))
-        r_motion = -cfg.w_object_motion * obj_speed
+        # ================= OPTIONAL TERMS (flag-gated) =================
 
-        # Crushing. Uses grip (the magnitude sum), which is the correct quantity
-        # for squeeze -- load would be near zero for a hand that is crushing but
-        # not lifting.
-        excess = sum(max(0.0, w.grip - cfg.grip_safe) for w in wrenches.values())
-        r_force = -cfg.w_excess_force * excess
+        # --- object motion penalty ---
+        if cfg.use_motion_penalty:
+            obj_speed = float(
+                np.linalg.norm(self.data.qvel[self.object_dof : self.object_dof + 3])
+            )
+            terms["r_motion"] = -cfg.w_object_motion * obj_speed
 
-        # Both hands holding indefinitely is the tug-of-war failure, so it costs
-        # something once the receiver has clearly taken the load.
-        both = wrenches[GIVER].n_contacts > 0 and wrenches[RECV].n_contacts > 0
-        r_deadlock = (
-            -cfg.w_deadlock if (both and fraction > cfg.deadlock_after_fraction) else 0.0
-        )
+        # --- deadlock: both hands holding long after the receiver took the load ---
+        if cfg.use_deadlock_penalty:
+            both = wrenches[GIVER].n_contacts > 0 and wrenches[RECV].n_contacts > 0
+            terms["r_deadlock"] = (
+                -cfg.w_deadlock if (both and fraction > cfg.deadlock_after_fraction) else 0.0
+            )
 
-        total = r_progress + r_approach + r_motion + r_force + r_deadlock
-        return total, {
-            "r_progress": r_progress,
-            "r_approach": r_approach,
-            "r_motion": r_motion,
-            "r_force": r_force,
-            "r_deadlock": r_deadlock,
-        }
+        # --- vel_rew: approach-speed penalty near the object ---
+        if cfg.vel_rew:
+            speed = self._palm_speed(RECV)
+            excess_vel = max(0.0, speed - cfg.v_min)
+            distance = float(np.linalg.norm(self._grip_point(RECV) - obj_pos))
+            terms["r_velocity"] = (
+                -cfg.lambda_vel * (excess_vel**2) * float(np.exp(-cfg.k_decay * distance))
+            )
+
+        # --- force-based signals ---
+        if cfg.use_force_rewards:
+            # Excess-force (crush) penalty. Uses grip, the magnitude sum, which
+            # is the right quantity for squeeze: load would be near zero for a
+            # hand that is crushing hard but not lifting.
+            excess = sum(max(0.0, w.grip - cfg.F_safe) for w in wrenches.values())
+            terms["r_force_excess"] = -cfg.lambda_force_excess * excess
+
+        if cfg.use_signal_1:
+            # Grasp firmness: reward committed contact, saturating so it cannot
+            # be farmed by squeezing ever harder.
+            firmness = sum(
+                float(np.tanh(w.grip / cfg.F_ref)) for w in wrenches.values()
+            )
+            terms["r_signal_1_firmness"] = cfg.lambda_firmness * firmness
+
+        if cfg.use_signal_2:
+            # Thumb opposition balance: a stable grasp opposes the thumb against
+            # the fingers, so penalise the ratio drifting away from parity.
+            r_balance = 0.0
+            for w in wrenches.values():
+                opposing = w.finger_grip + cfg.palm_weight * w.palm_grip
+                if w.grip > cfg.F_threshold:
+                    ratio = w.thumb_grip / (opposing + 1e-6)
+                    r_balance -= cfg.lambda_balance * abs(ratio - 1.0)
+            terms["r_signal_2_balance"] = r_balance
+
+        if cfg.use_signal_instability:
+            # Contact churn paired with a force drop: fingers losing and
+            # regaining the object rather than holding it.
+            r_instability = 0.0
+            for side, w in wrenches.items():
+                churn = abs(w.n_contacts - self._prev_contacts[side])
+                drop = max(0.0, self._prev_grip[side] - w.grip)
+                r_instability -= cfg.lambda_instability * churn * drop
+            terms["r_signal_instability"] = r_instability
+
+        for side, w in wrenches.items():
+            self._prev_contacts[side] = w.n_contacts
+            self._prev_grip[side] = w.grip
+
+        return float(sum(terms.values())), terms
 
     def _success(self, wrenches, fraction: float) -> bool:
         obj_pos, _ = self._object_pose()
@@ -498,6 +595,9 @@ class HandoverEnv(gym.Env):
         wrenches = self.registry.hand_wrenches(self.data)
         self._prev_fraction = load_fraction(wrenches, self.weight)
         self._prev_potential = self._potential(self._object_pose()[0])
+        for side, w in wrenches.items():
+            self._prev_contacts[side] = w.n_contacts
+            self._prev_grip[side] = w.grip
 
         info = {**draw}
         if self.cfg.include_state:

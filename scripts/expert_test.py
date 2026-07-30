@@ -61,6 +61,7 @@ def expert_action(env, step: int, cfg) -> np.ndarray:
     wrenches = env.registry.hand_wrenches(env.data)
     recv_grip = wrenches[RECV].grip
     giver_grip = wrenches[GIVER].grip
+    recv_load = wrenches[RECV].load_vertical
 
     parts[GIVER][6] = 0.0
     parts[RECV][6] = -1.0
@@ -68,14 +69,21 @@ def expert_action(env, step: int, cfg) -> np.ndarray:
     if distance > cfg.grasp_distance:
         parts[RECV][:3] = approach
     elif recv_grip < cfg.grip_threshold:
-        parts[RECV][:3] = approach * 0.3
+        # Settle in and close. Approach is scaled right down so the hand does not
+        # keep driving into an object it is already touching.
+        parts[RECV][:3] = approach * 0.2
         parts[RECV][6] = 1.0
+    elif recv_load < cfg.load_threshold:
+        # Gripping but not yet carrying. Keep closing gently and let the load
+        # build; releasing on grip alone lets go before anything is supported,
+        # which is what dropped the object.
+        parts[RECV][6] = 0.5
     elif giver_grip > cfg.release_threshold:
-        # Hold the grip that already works -- rate 0, not +1. Continuing to close
-        # while the giver is still at full grip makes the two hands fight over
-        # the object and squeeze it out sideways.
+        # The receiver is genuinely carrying, so the giver can let go -- slowly.
+        # Hold the receiver's grip steady rather than closing further; two hands
+        # both at full closure fight over the object and squeeze it out.
         parts[RECV][6] = 0.0
-        parts[GIVER][6] = -1.0
+        parts[GIVER][6] = -cfg.release_rate
     else:
         parts[RECV][6] = 0.0
         parts[GIVER][6] = -1.0
@@ -115,11 +123,16 @@ def rollout(env, policy, steps, rng=None):
 
 class ScriptCfg:
     grasp_distance = 0.02
-    # Must be below the grip the receiver can actually reach (~9.3 N here); a
-    # higher value deadlocks the state machine in the "keep closing" branch and
-    # the giver never releases.
-    grip_threshold = 6.0
+    # Below the grip the receiver can actually reach (~9.3 N); a higher value
+    # deadlocks the state machine in "keep closing" and the giver never releases.
+    grip_threshold = 5.0
+    # Newtons of weight the receiver must actually be carrying before the giver
+    # starts to let go. Gating release on grip alone releases into thin air.
+    load_threshold = 0.5
     release_threshold = 1.0
+    # Gradual release: opening at full rate drops the object before the receiver
+    # can take up the slack.
+    release_rate = 0.25
 
 
 def main():

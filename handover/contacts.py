@@ -40,6 +40,15 @@ class HandWrench:
     grip: float = 0.0
     """Sum of contact-force magnitudes -- how hard the hand squeezes."""
 
+    thumb_grip: float = 0.0
+    """Squeeze contributed by the thumb alone."""
+
+    finger_grip: float = 0.0
+    """Squeeze contributed by the three fingers."""
+
+    palm_grip: float = 0.0
+    """Squeeze contributed by the palm."""
+
     load: np.ndarray = field(default_factory=lambda: np.zeros(3))
     """Net contact force on the object from this hand, in world coordinates."""
 
@@ -54,12 +63,22 @@ class HandWrench:
         return float(self.load[2])
 
 
+# Allegro body-name fragments, used to attribute a contact to a digit. Thumb and
+# fingers are separated because opposition balance -- how the thumb's squeeze
+# compares to the fingers' -- is a distinct signal from total grip.
+THUMB = "thumb"
+FINGER = "finger"
+PALM = "palm"
+OTHER = "other"
+
+
 class ContactRegistry:
     """Resolves geoms to owners by name once, so nothing downstream guesses."""
 
     def __init__(self, model: mujoco.MjModel):
         self.model = model
         self.geom_owner: list[str] = []
+        self.geom_part: list[str] = []
 
         for gid in range(model.ngeom):
             body = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.geom_bodyid[gid])
@@ -72,6 +91,16 @@ class ContactRegistry:
                 self.geom_owner.append(RECV)
             else:
                 self.geom_owner.append(WORLD)
+
+            # Which part of the hand, for the per-digit breakdown.
+            if "_th_" in body or body.endswith("_th_tip"):
+                self.geom_part.append(THUMB)
+            elif any(f"_{f}_" in body or body.endswith(f"_{f}_tip") for f in ("ff", "mf", "rf")):
+                self.geom_part.append(FINGER)
+            elif body.endswith("_palm"):
+                self.geom_part.append(PALM)
+            else:
+                self.geom_part.append(OTHER)
 
         self.object_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, OBJECT)
         if self.object_body_id < 0:
@@ -118,7 +147,16 @@ class ContactRegistry:
                 force_world = -force_world
 
             wrench = out[hand]
-            wrench.grip += float(np.linalg.norm(buf[:3]))
+            magnitude = float(np.linalg.norm(buf[:3]))
+            wrench.grip += magnitude
+
+            part = self.geom_part[con.geom1 if not object_is_geom1 else con.geom2]
+            if part == THUMB:
+                wrench.thumb_grip += magnitude
+            elif part == FINGER:
+                wrench.finger_grip += magnitude
+            elif part == PALM:
+                wrench.palm_grip += magnitude
             wrench.load += force_world
             wrench.torque += np.cross(con.pos - obj_com, force_world)
             wrench.n_contacts += 1
