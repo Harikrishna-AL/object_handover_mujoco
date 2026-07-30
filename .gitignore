@@ -1,0 +1,43 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- MuJoCo ---
+# Runtime log the engine drops in the working directory.
+MUJOCO_LOG.TXT
+# Composed scene is a build artifact: regenerate with `python handover/scene.py`.
+scene_composed.xml
+
+# --- Assets fetched separately ---
+# Menagerie is cloned to ~/mujoco_menagerie; never vendor it in.
+mujoco_menagerie/
+
+# --- Training outputs ---
+logs/
+outputs/
+runs/
+wandb/
+checkpoints/
+*.mp4
+*.gif
+
+# --- OS / editors ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
