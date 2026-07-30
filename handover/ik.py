@@ -66,6 +66,12 @@ class ArmIK:
             self._rest_posture = rest
         self.rest_posture = np.asarray(self._rest_posture, dtype=float)
 
+        # Scratch state allocated once. Building an MjData per solve dominated
+        # the control step: it runs twice per step, at 50 Hz, for every worker.
+        self._scratch = mujoco.MjData(model)
+        self._jacp = np.zeros((3, model.nv))
+        self._jacr = np.zeros((3, model.nv))
+
     def solve(
         self,
         data: mujoco.MjData,
@@ -79,12 +85,11 @@ class ArmIK:
 
         `data` is read for the starting guess and left unmodified.
         """
-        scratch = mujoco.MjData(self.model)
+        scratch = self._scratch
         scratch.qpos[:] = data.qpos
         scratch.qvel[:] = 0.0
 
-        jacp = np.zeros((3, self.model.nv))
-        jacr = np.zeros((3, self.model.nv))
+        jacp, jacr = self._jacp, self._jacr
         err = np.zeros(6 if target_quat is not None else 3)
 
         for _ in range(iters):

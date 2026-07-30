@@ -22,7 +22,7 @@ Two things about the design are deliberate and load-bearing:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import gymnasium as gym
 import mujoco
@@ -40,6 +40,25 @@ from .scene import (
 )
 
 G = 9.81
+
+
+@dataclass
+class DomainRandomization:
+    """Per-episode physics jitter, for sim-to-real robustness.
+
+    A load-transfer policy is unusually sensitive to exactly these quantities:
+    the learned behaviour is a force exchange, so friction, mass and contact
+    compliance are first-order rather than nuisance parameters. Wired in from
+    the start because retrofitting it means retraining.
+    """
+
+    enabled: bool = True
+    mass_range: tuple[float, float] = (0.7, 1.4)
+    friction_range: tuple[float, float] = (0.7, 1.3)
+    # Contact softness: solref[0] is the time constant, larger being softer.
+    solref_range: tuple[float, float] = (0.8, 1.3)
+    # Finger stiffness stands in for tendon slack and actuator variation.
+    hand_gain_range: tuple[float, float] = (0.7, 1.4)
 
 
 @dataclass
@@ -74,10 +93,23 @@ class EnvConfig:
     w_progress: float = 12.0
     w_success: float = 50.0
     w_drop: float = 20.0
-    w_approach: float = 1.5
+    # Potential-based shaping telescopes to w_approach * (total distance closed),
+    # so this is the whole budget for discovering the approach -- at 1.5 that was
+    # 0.45 for the entire reach, invisible next to a 50-point success bonus. Only
+    # the sum matters, and the potential form means raising it cannot reintroduce
+    # a survival penalty.
+    w_approach: float = 20.0
     w_object_motion: float = 0.4
     w_excess_force: float = 0.5
     w_deadlock: float = 0.02
+    # Discount used inside the shaping term. Deliberately 1.0, not the learner's
+    # 0.99: with gamma*phi(s') - phi(s) and a negative potential, the stationary
+    # term is (gamma-1)*phi, which is POSITIVE and pays an agent ~0.06 per step
+    # to sit still far from the object -- worth +22 over an episode, more than a
+    # successful handover earned. At 1.0 the term telescopes exactly to
+    # phi(end) - phi(start), so standing still is worth zero and only real
+    # progress pays.
+    shaping_gamma: float = 1.0
 
     # Grip force above which we start calling it crushing, in newtons. A full
     # closure on this object already sits near 33 N, so a lower threshold would
@@ -88,6 +120,35 @@ class EnvConfig:
     # Both hands holding is the point of a handover, but only briefly; this
     # starts charging for it once the receiver has clearly taken the load.
     deadlock_after_fraction: float = 0.5
+
+    # --- curriculum ---
+    # "policy"   : the giver is controlled by the policy. The final task.
+    # "scripted" : the giver holds, then opens once the receiver has taken hold.
+    #
+    # Stage 1 needs "scripted". A fresh policy random-walks the giver's grip to
+    # zero within ~30 steps, the object drops, the episode ends, and the receiver
+    # never sees enough of the task to learn the approach. This is the same
+    # scripted release the Isaac environment hard-coded -- the difference is that
+    # here it is an explicit, temporary stage that stage 2 removes, rather than a
+    # permanent fixture standing in for the decision we actually want learned.
+    giver_mode: str = "policy"
+
+    # Receiver grip force at which the scripted giver begins to let go.
+    scripted_release_grip: float = 5.0
+
+    # Fractions of the way from the grasp pose to the nominal start that the
+    # receiver may begin an episode at. Starting sometimes close is what makes
+    # the task discoverable: from the full distance the policy has to execute a
+    # long directed reach before it ever sees a grasp, so it converges instead on
+    # standing still, which is safe and scores about 22. A snapshot is cached per
+    # entry, so this costs a one-off build rather than per-episode work.
+    start_distance_mix: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
+
+    # Whether to put the privileged critic state in the info dict. Off for the
+    # single-agent baseline, which does not use it: the array is shipped across
+    # a process boundary on every step of every worker, and paying that for
+    # something nobody reads is a pointless throughput tax. MAPPO turns it on.
+    include_state: bool = False
 
 
 class HandoverEnv(gym.Env):
@@ -105,11 +166,13 @@ class HandoverEnv(gym.Env):
         cfg: EnvConfig | None = None,
         scene_cfg: SceneConfig | None = None,
         control_cfg: ControlConfig | None = None,
+        randomization: DomainRandomization | None = None,
         seed: int | None = None,
     ):
         self.cfg = cfg or EnvConfig()
         self.scene_cfg = scene_cfg or SceneConfig()
         self.control_cfg = control_cfg or ControlConfig()
+        self.randomization = randomization or DomainRandomization()
 
         self.model, _ = build_model(self.scene_cfg)
         self.data = mujoco.MjData(self.model)
@@ -123,10 +186,36 @@ class HandoverEnv(gym.Env):
         self.object_qpos = self.model.jnt_qposadr[self.object_joint]
         self.object_dof = self.model.jnt_dofadr[self.object_joint]
 
+        self.object_body = self.registry.object_body_id
+        self.object_geom = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "object_geom")
+        self._hand_act_ids = np.array(
+            sorted(
+                aid
+                for arm in self.controller.arms.values()
+                for aid in arm.hand.act_ids.values()
+            ),
+            dtype=int,
+        )
+        # Nominal values, so each episode randomizes from the same baseline
+        # rather than compounding jitter on top of the previous draw.
+        self._nominal = {
+            "mass": float(self.model.body_mass[self.object_body]),
+            "friction": self.model.geom_friction[self.object_geom].copy(),
+            "solref": self.model.geom_solref[self.object_geom].copy(),
+            "gain": self.model.actuator_gainprm[self._hand_act_ids, 0].copy(),
+            "bias": self.model.actuator_biasprm[self._hand_act_ids, 1].copy(),
+        }
+
         self._rng = np.random.default_rng(seed)
+        # Snapshot of the settled post-grasp state, built once and restored on
+        # every reset. Establishing the giver's grasp costs 700 physics steps
+        # plus two IK solves -- half the wall time of an entire episode -- and
+        # it is deterministic, so paying it per episode is pure waste.
+        self._start_snapshots: list[dict[str, np.ndarray]] | None = None
         self._step_count = 0
         self._hold_count = 0
         self._prev_fraction = 0.0
+        self._prev_potential = 0.0
 
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.controller.action_dim,), dtype=np.float32
@@ -139,6 +228,38 @@ class HandoverEnv(gym.Env):
             low=-np.inf, high=np.inf, shape=self._privileged_state().shape, dtype=np.float32
         )
 
+    # ---------------------------------------------------------- randomization
+
+    def _randomize(self) -> dict[str, float]:
+        """Draw fresh physics parameters. Returns what was drawn, for logging."""
+        dr = self.randomization
+        nom = self._nominal
+        if not dr.enabled:
+            self.weight = nom["mass"] * G
+            return {}
+
+        mass_scale = float(self._rng.uniform(*dr.mass_range))
+        self.model.body_mass[self.object_body] = nom["mass"] * mass_scale
+        # Load fraction is defined against weight, so it has to track the draw.
+        self.weight = nom["mass"] * mass_scale * G
+
+        friction_scale = float(self._rng.uniform(*dr.friction_range))
+        self.model.geom_friction[self.object_geom] = nom["friction"] * friction_scale
+
+        solref_scale = float(self._rng.uniform(*dr.solref_range))
+        self.model.geom_solref[self.object_geom, 0] = nom["solref"][0] * solref_scale
+
+        gain_scale = float(self._rng.uniform(*dr.hand_gain_range))
+        self.model.actuator_gainprm[self._hand_act_ids, 0] = nom["gain"] * gain_scale
+        self.model.actuator_biasprm[self._hand_act_ids, 1] = nom["bias"] * gain_scale
+
+        return {
+            "dr_mass": mass_scale,
+            "dr_friction": friction_scale,
+            "dr_solref": solref_scale,
+            "dr_hand_gain": gain_scale,
+        }
+
     # ------------------------------------------------------------------ setup
 
     def _object_pose(self) -> tuple[np.ndarray, np.ndarray]:
@@ -150,6 +271,13 @@ class HandoverEnv(gym.Env):
         self.data.qpos[self.object_qpos : self.object_qpos + 3] = pos
         self.data.qpos[self.object_qpos + 3 : self.object_qpos + 7] = quat
         self.data.qvel[self.object_dof : self.object_dof + 6] = 0.0
+
+    def _recv_grasp_palm(self) -> np.ndarray:
+        """Palm position that would put the receiver's pocket on the object."""
+        obj = np.asarray(self.scene_cfg.obj_init_pos, dtype=float)
+        mat = np.zeros(9)
+        mujoco.mju_quat2Mat(mat, np.asarray(self.scene_cfg.recv_start_quat, dtype=float))
+        return obj - mat.reshape(3, 3) @ np.asarray(POCKET_BODY_LEFT, dtype=float)
 
     def _grip_point(self, side: str) -> np.ndarray:
         """World position of a hand's grasp pocket, given its current palm pose."""
@@ -237,6 +365,12 @@ class HandoverEnv(gym.Env):
 
     # ---------------------------------------------------------------- reward
 
+    def _potential(self, obj_pos: np.ndarray) -> float:
+        """Shaping potential: closer receiver is better."""
+        return -self.cfg.w_approach * float(
+            np.linalg.norm(self._grip_point(RECV) - obj_pos)
+        )
+
     def _reward(self, wrenches, fraction: float) -> tuple[float, dict]:
         cfg = self.cfg
         obj_pos, _ = self._object_pose()
@@ -246,12 +380,20 @@ class HandoverEnv(gym.Env):
         progress = float(np.clip(fraction, 0.0, 1.0) - np.clip(self._prev_fraction, 0.0, 1.0))
         r_progress = cfg.w_progress * progress
 
-        # Per-agent shaping. The receiver is paid to close the gap between its
-        # grasp pocket and the object; the giver is paid to hold it still while
-        # that happens.
-        approach = float(np.linalg.norm(self._grip_point(RECV) - obj_pos))
-        r_approach = -cfg.w_approach * approach
+        # Per-agent shaping, potential-based: gamma*phi(s') - phi(s).
+        #
+        # A plain -w*distance term is charged every step, so merely staying alive
+        # costs ~180 over a full episode while dropping the object at step 28
+        # costs ~33. Training duly discovered that dropping scores better than
+        # persisting. Potential-based shaping telescopes away over an episode, so
+        # it cannot create that incentive, and it provably leaves the optimal
+        # policy unchanged (Ng, Harada & Russell 1999).
+        potential = self._potential(obj_pos)
+        r_approach = cfg.shaping_gamma * potential - self._prev_potential
+        self._prev_potential = potential
 
+        # Charged per step, but zero for a still object, so it cannot punish
+        # survival the way an unconditional distance term does.
         obj_speed = float(np.linalg.norm(self.data.qvel[self.object_dof : self.object_dof + 3]))
         r_motion = -cfg.w_object_motion * obj_speed
 
@@ -287,13 +429,63 @@ class HandoverEnv(gym.Env):
 
     # ------------------------------------------------------------- gym API
 
+    def _randomize_off(self) -> None:
+        nom = self._nominal
+        self.model.body_mass[self.object_body] = nom["mass"]
+        self.model.geom_friction[self.object_geom] = nom["friction"]
+        self.model.geom_solref[self.object_geom] = nom["solref"]
+        self.model.actuator_gainprm[self._hand_act_ids, 0] = nom["gain"]
+        self.model.actuator_biasprm[self._hand_act_ids, 1] = nom["bias"]
+        self.weight = nom["mass"] * G
+
+    def _build_start_snapshot(self, distance: float) -> dict[str, np.ndarray]:
+        """Settle a start state with the receiver `distance` of the way out."""
+        scene = replace(
+            self.scene_cfg,
+            recv_start_palm=tuple(
+                np.asarray(self._recv_grasp_palm(), dtype=float)
+                + distance
+                * (
+                    np.asarray(self.scene_cfg.recv_start_palm, dtype=float)
+                    - np.asarray(self._recv_grasp_palm(), dtype=float)
+                )
+            ),
+        )
+        apply_start_pose(self.model, self.data, scene)
+        self.controller.reset(self.data)
+        self._establish_giver_grasp()
+        return {
+            "qpos": self.data.qpos.copy(),
+            "qvel": self.data.qvel.copy(),
+            "ctrl": self.data.ctrl.copy(),
+            "act": self.data.act.copy(),
+        }
+
     def reset(self, *, seed: int | None = None, options=None):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
-        apply_start_pose(self.model, self.data, self.scene_cfg)
-        self.controller.reset(self.data)
-        self._establish_giver_grasp()
+        # The snapshot is built at nominal parameters so it is reusable; the
+        # draw is applied on top and the grasp re-settles in a step or two.
+        if self._start_snapshots is None:
+            self._randomize_off()
+            self._start_snapshots = [
+                self._build_start_snapshot(d) for d in self.cfg.start_distance_mix
+            ]
+
+        snap = self._start_snapshots[int(self._rng.integers(len(self._start_snapshots)))]
+        mujoco.mj_resetData(self.model, self.data)
+        self.data.qpos[:] = snap["qpos"]
+        self.data.qvel[:] = snap["qvel"]
+        self.data.ctrl[:] = snap["ctrl"]
+        if snap["act"].size:
+            self.data.act[:] = snap["act"]
+
+        # Drawn after the snapshot is restored, so every episode randomizes from
+        # the same nominal baseline instead of compounding onto the last draw.
+        draw = self._randomize()
+        mujoco.mj_forward(self.model, self.data)
+
         # Re-latch command targets: the settle moved the palms slightly. The
         # giver's grip command is carried over rather than zeroed, so the first
         # policy action modulates an existing grasp instead of inheriting one.
@@ -305,11 +497,28 @@ class HandoverEnv(gym.Env):
         self._hold_count = 0
         wrenches = self.registry.hand_wrenches(self.data)
         self._prev_fraction = load_fraction(wrenches, self.weight)
+        self._prev_potential = self._potential(self._object_pose()[0])
 
-        return self._observe(), {"state": self._privileged_state()}
+        info = {**draw}
+        if self.cfg.include_state:
+            info["state"] = self._privileged_state()
+        return self._observe(), info
+
+    def _apply_curriculum(self, action: np.ndarray) -> np.ndarray:
+        """Override the giver's action while it is on the scripted stage."""
+        if self.cfg.giver_mode == "policy":
+            return action
+
+        wrenches = self.registry.hand_wrenches(self.data)
+        parts = self.controller.split(action)
+        giver = np.zeros_like(parts[GIVER])
+        # Hold still, then release once the receiver has a real grip on it.
+        giver[6] = -1.0 if wrenches[RECV].grip > self.cfg.scripted_release_grip else 0.0
+        return np.concatenate([giver, parts[RECV]])
 
     def step(self, action):
         action = np.asarray(action, dtype=np.float64).reshape(-1)
+        action = self._apply_curriculum(action)
         self.controller.apply(self.data, action)
         for _ in range(self.cfg.decimation):
             self.controller.compensate_gravity(self.data)
@@ -341,16 +550,18 @@ class HandoverEnv(gym.Env):
         self._prev_fraction = fraction
 
         info = {
-            "state": self._privileged_state(),
             "load_fraction": fraction,
             "giver_grip": wrenches[GIVER].grip,
             "recv_grip": wrenches[RECV].grip,
             "giver_load_z": wrenches[GIVER].load_vertical,
             "recv_load_z": wrenches[RECV].load_vertical,
             "object_height": float(obj_pos[2]),
+            "approach_dist": float(np.linalg.norm(self._grip_point(RECV) - obj_pos)),
             "success": bool(held),
             "dropped": dropped,
             "hold_count": self._hold_count,
             **terms,
         }
+        if self.cfg.include_state:
+            info["state"] = self._privileged_state()
         return self._observe(), float(reward), terminated, truncated, info

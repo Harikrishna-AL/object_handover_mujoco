@@ -42,33 +42,44 @@ def receiver_grasp_palm(env) -> np.ndarray:
 
 
 def expert_action(env, step: int, cfg) -> np.ndarray:
-    """A scripted handover, staged the way a person would do it."""
+    """A scripted handover, staged on state rather than on a step schedule.
+
+    Fixed step thresholds break the moment the start distance is randomized: an
+    episode that begins at the grasp pose would spend 150 steps "approaching"
+    and shove the object around. Gating on the actual geometry keeps the expert
+    honest across the whole start distribution.
+    """
     action = np.zeros(env.controller.action_dim)
     parts = env.controller.split(action)
 
     pos, _ = env.controller.arms[RECV].palm_pose(env.data)
     error = receiver_grasp_palm(env) - pos
+    distance = float(np.linalg.norm(error))
+    # Scale down near the goal so the hand settles instead of hammering in.
     approach = np.clip(error / env.control_cfg.translation_scale, -1.0, 1.0)
 
-    if step < cfg.approach_until:
-        # Close the gap; nobody changes grip yet.
+    wrenches = env.registry.hand_wrenches(env.data)
+    recv_grip = wrenches[RECV].grip
+    giver_grip = wrenches[GIVER].grip
+
+    parts[GIVER][6] = 0.0
+    parts[RECV][6] = -1.0
+
+    if distance > cfg.grasp_distance:
         parts[RECV][:3] = approach
-        parts[GIVER][6] = 0.0
-        parts[RECV][6] = -1.0
-    elif step < cfg.grip_until:
-        # Receiver takes hold while the giver keeps carrying.
-        parts[RECV][:3] = approach
+    elif recv_grip < cfg.grip_threshold:
+        parts[RECV][:3] = approach * 0.3
         parts[RECV][6] = 1.0
-    elif step < cfg.release_until:
-        # Giver lets go, gradually, while the receiver holds on.
-        parts[RECV][:3] = approach * 0.2
-        parts[RECV][6] = 1.0
+    elif giver_grip > cfg.release_threshold:
+        # Hold the grip that already works -- rate 0, not +1. Continuing to close
+        # while the giver is still at full grip makes the two hands fight over
+        # the object and squeeze it out sideways.
+        parts[RECV][6] = 0.0
         parts[GIVER][6] = -1.0
     else:
-        # Giver retreats upward, receiver keeps holding.
-        parts[GIVER][2] = 1.0
+        parts[RECV][6] = 0.0
         parts[GIVER][6] = -1.0
-        parts[RECV][6] = 1.0
+        parts[GIVER][2] = 1.0  # retreat clear
 
     return np.concatenate([parts[GIVER], parts[RECV]])
 
@@ -77,6 +88,7 @@ def rollout(env, policy, steps, rng=None):
     obs, _ = env.reset(seed=0)
     total, peak_f, success, dropped = 0.0, -np.inf, False, False
     trace = []
+    terms: dict[str, float] = {}
     for k in range(steps):
         action = policy(env, k, rng)
         obs, reward, terminated, truncated, info = env.step(action)
@@ -86,6 +98,8 @@ def rollout(env, policy, steps, rng=None):
         dropped = dropped or info["dropped"]
         trace.append((k, info["load_fraction"], info["giver_grip"], info["recv_grip"],
                       info["object_height"], reward))
+        for key in ("r_progress", "r_approach", "r_motion", "r_force", "r_deadlock"):
+            terms[key] = terms.get(key, 0.0) + info.get(key, 0.0)
         if terminated or truncated:
             break
     return {
@@ -95,13 +109,17 @@ def rollout(env, policy, steps, rng=None):
         "success": success,
         "dropped": dropped,
         "trace": trace,
+        "terms": terms,
     }
 
 
 class ScriptCfg:
-    approach_until = 150
-    grip_until = 200
-    release_until = 300
+    grasp_distance = 0.02
+    # Must be below the grip the receiver can actually reach (~9.3 N here); a
+    # higher value deadlocks the state machine in the "keep closing" branch and
+    # the giver never releases.
+    grip_threshold = 6.0
+    release_threshold = 1.0
 
 
 def main():
@@ -152,6 +170,12 @@ def main():
               f"{'obj_z':>7s} {'reward':>8s}")
         for row in results["expert"]["trace"][::25]:
             print("  %4d %7.3f %11.2f %10.2f %7.3f %8.3f" % row)
+
+    print("\nreward term totals:")
+    keys = ["r_progress", "r_approach", "r_motion", "r_force", "r_deadlock"]
+    print("  %-10s" % "policy" + "".join("%14s" % k for k in keys))
+    for name, r in results.items():
+        print("  %-10s" % name + "".join("%14.2f" % r["terms"].get(k, 0.0) for k in keys))
 
     expert = results["expert"]
     others = max(r["return"] for n, r in results.items() if n != "expert")
