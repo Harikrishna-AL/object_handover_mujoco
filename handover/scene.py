@@ -77,8 +77,13 @@ class SceneConfig:
     # Episode start: palm targets for the two arms, solved by IK. Chosen to keep
     # the arms well clear of each other so the approach is something the policy
     # has to do rather than something it starts inside.
+    # The receiver's target is chosen for joint margin, not just reachability:
+    # anywhere with x >= 0.76 folds the Gen3's elbow onto its -2.57 rad stop, and
+    # an arm that starts saturated cannot move in that direction at all. This
+    # start leaves 0.72 rad of margin while staying 0.36 m from the handover
+    # point, so the approach remains something the policy has to do.
     giver_start_palm: tuple[float, float, float] = (0.40, -0.12, 0.78)
-    recv_start_palm: tuple[float, float, float] = (0.80, 0.12, 0.38)
+    recv_start_palm: tuple[float, float, float] = (0.70, 0.30, 0.70)
 
     # Standoff between the arm's tool flange and the Allegro palm. Mounting the
     # hand flush drives the finger proximals ~1 cm into the wrist geoms; real
