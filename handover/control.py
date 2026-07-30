@@ -79,6 +79,14 @@ class ControlConfig:
     # and nothing in the transfer problem needs three groups.
     hand_dof: int = 1
 
+    # Grip is commanded as a RATE, not an absolute closure, so a zero action
+    # means "hold the grip you have". With absolute closure the neutral action
+    # maps to half-closed, which releases an established grasp on the very first
+    # step -- every episode would begin by dropping the object, and the policy
+    # would have to learn to hold on before it could learn anything else.
+    # This also matches the Cartesian components, which are already deltas.
+    closure_rate: float = 0.05
+
     # How far the integrated command may run ahead of where the palm actually
     # is. Without this leash a policy that pushes into a joint limit, or a hand
     # blocked by contact, accumulates an ever more distant target and then needs
@@ -131,12 +139,15 @@ class ArmController:
         self.hand = HandController(model, f"{side}_")
         self._target_pos = np.zeros(3)
         self._target_quat = np.array([1.0, 0.0, 0.0, 0.0])
+        # Last commanded grip, in [0, 1]. Proprioceptive and available on real
+        # hardware, unlike the contact forces it produces.
+        self._closure_cmd = 0.0
 
     @property
     def action_dim(self) -> int:
         return 6 + self.cfg.hand_dof
 
-    def reset(self, data: mujoco.MjData) -> None:
+    def reset(self, data: mujoco.MjData, closure: float = 0.0) -> None:
         """Latch the current palm pose as the command target.
 
         Also adopts the current joint configuration as the IK's rest posture.
@@ -150,6 +161,12 @@ class ArmController:
         self._target_pos = data.xpos[self.body_id].copy()
         self._target_quat = data.xquat[self.body_id].copy()
         self.ik.rest_posture = data.qpos[self.ik.qpos_ids].copy()
+        self._closure_cmd = float(np.clip(closure, 0.0, 1.0))
+
+    @property
+    def hand_closure_command(self) -> float:
+        """The grip closure most recently commanded, in [0, 1]."""
+        return self._closure_cmd
 
     def palm_pose(self, data: mujoco.MjData) -> tuple[np.ndarray, np.ndarray]:
         return data.xpos[self.body_id].copy(), data.xquat[self.body_id].copy()
@@ -192,7 +209,12 @@ class ArmController:
         rather than clipping -- clipping would make half the action range dead.
         """
         hand_action = np.clip(action[6:], -1.0, 1.0)
-        closures = (hand_action + 1.0) * 0.5
+        self._closure_cmd = float(
+            np.clip(self._closure_cmd + hand_action[0] * self.cfg.closure_rate, 0.0, 1.0)
+        )
+        closures = np.full(max(1, self.cfg.hand_dof), self._closure_cmd)
+        if self.cfg.hand_dof > 1:
+            closures = np.clip(closures + hand_action[1:] * self.cfg.closure_rate, 0.0, 1.0)
 
         if self.cfg.hand_dof == 1:
             return self.hand.target(float(closures[0]))
@@ -275,9 +297,10 @@ class BimanualController:
     def action_dim(self) -> int:
         return sum(arm.action_dim for arm in self.arms.values())
 
-    def reset(self, data: mujoco.MjData) -> None:
-        for arm in self.arms.values():
-            arm.reset(data)
+    def reset(self, data: mujoco.MjData, closures: dict[str, float] | None = None) -> None:
+        closures = closures or {}
+        for side, arm in self.arms.items():
+            arm.reset(data, closure=closures.get(side, 0.0))
 
     def split(self, action: np.ndarray) -> dict[str, np.ndarray]:
         """Slice a joint action into per-arm actions."""

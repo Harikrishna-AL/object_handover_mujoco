@@ -25,10 +25,29 @@ CLOSED = {
     "thj0": 1.20, "thj1": 0.60, "thj2": 0.70, "thj3": 1.00,
 }
 
-# Grasp pocket centre in the palm frame at full closure, measured from the model
-# (see scripts/probe_pocket.py). The y component mirrors with hand chirality.
-POCKET_RIGHT = (-0.031, -0.016, 0.072)
-POCKET_LEFT = (-0.031, 0.016, 0.072)
+# Grasp pocket centre at full closure, measured from the model. The y component
+# mirrors with hand chirality.
+#
+# Two frames, and confusing them is a real trap. The palm body carries its own
+# quat="0 1 0 1" in the Menagerie model, so the hand model's root frame and the
+# palm *body* frame differ by 90 degrees:
+#
+#   POCKET_MODEL_* -- offset in the hand model's root frame. Use when placing a
+#       whole hand by an attachment frame (the arm-free validation scene).
+#   POCKET_BODY_*  -- offset in the palm body frame. Use at runtime with
+#       data.xquat[palm], which reports the body's orientation.
+#
+# Applying the model-frame offset to the body quat puts the pocket ~13 cm from
+# where the fingers actually close, and the hand then grips empty space.
+POCKET_MODEL_RIGHT = (-0.031, -0.016, 0.072)
+POCKET_MODEL_LEFT = (-0.031, 0.016, 0.072)
+POCKET_BODY_RIGHT = (0.0713, 0.0165, -0.0312)
+POCKET_BODY_LEFT = (0.0713, -0.0165, -0.0312)
+
+# Backwards-compatible aliases for the scene builder's attachment maths.
+POCKET_RIGHT = POCKET_MODEL_RIGHT
+POCKET_LEFT = POCKET_MODEL_LEFT
+
 GRIP_OPENING = 0.049
 
 OPEN = {name: 0.0 for name in CLOSED}

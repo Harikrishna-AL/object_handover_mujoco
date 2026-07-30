@@ -54,8 +54,9 @@ class SceneConfig:
     # its length, which is the geometry a real rod handover takes.
     obj_quat: tuple[float, float, float, float] = (0.70710678, 0.70710678, 0.0, 0.0)
 
-    # Where the object starts, in world coordinates.
-    obj_init_pos: tuple[float, float, float] = (0.55, 0.0, 0.60)
+    # Where the object starts, in world coordinates: the giver's grasp pocket,
+    # so the static scene matches what the environment builds at reset.
+    obj_init_pos: tuple[float, float, float] = (0.50, -0.02, 0.52)
 
     # Palm poses for the arm-free validation scene only. Set so the two hands
     # face each other across the object, gripping at different heights.
@@ -82,8 +83,20 @@ class SceneConfig:
     # an arm that starts saturated cannot move in that direction at all. This
     # start leaves 0.72 rad of margin while staying 0.36 m from the handover
     # point, so the approach remains something the policy has to do.
-    giver_start_palm: tuple[float, float, float] = (0.40, -0.12, 0.78)
-    recv_start_palm: tuple[float, float, float] = (0.70, 0.30, 0.70)
+    giver_start_palm: tuple[float, float, float] = (0.531, -0.037, 0.591)
+    recv_start_palm: tuple[float, float, float] = (0.62, 0.25, 0.55)
+
+    # Start orientations matter as much as positions: the giver holds from above
+    # (palm rolled 180 deg about x, fingers curling down) and the receiver comes
+    # from below. Solving position-only leaves the palm at whatever roll the IK
+    # happens to land on, which will not hold an object against gravity.
+    # The grasp pocket sits along the palm body's +x, so "approach from above"
+    # means rotating body +x to point down: +90 deg about y. Derived from the
+    # corrected palm-frame pocket, not guessed.
+    giver_start_quat: tuple[float, float, float, float] = (0.70710678, 0.0, 0.70710678, 0.0)
+    # From below (-90 about y) with a -90 yaw. Of the four from-below variants
+    # this is the only one the Gen3 reaches without pinning a joint on its stop.
+    recv_start_quat: tuple[float, float, float, float] = (0.5, -0.5, -0.5, -0.5)
 
     # Standoff between the arm's tool flange and the Allegro palm. Mounting the
     # hand flush drives the finger proximals ~1 cm into the wrist geoms; real
@@ -378,12 +391,14 @@ def apply_start_pose(
     apply_home(model, data, cfg)
 
     errors = {}
-    for key, joints, body, target in (
-        (GIVER, GIVER_ARM_JOINTS, "giver_hand_palm", cfg.giver_start_palm),
-        (RECV, RECV_ARM_JOINTS, "recv_hand_palm", cfg.recv_start_palm),
+    for key, joints, body, target, quat in (
+        (GIVER, GIVER_ARM_JOINTS, "giver_hand_palm", cfg.giver_start_palm, cfg.giver_start_quat),
+        (RECV, RECV_ARM_JOINTS, "recv_hand_palm", cfg.recv_start_palm, cfg.recv_start_quat),
     ):
         solver = ArmIK(model, body, joints)
-        angles, err = solver.solve(data, np.asarray(target, dtype=float))
+        angles, err = solver.solve(
+            data, np.asarray(target, dtype=float), target_quat=np.asarray(quat, dtype=float)
+        )
         for name, value in zip(joints, angles):
             jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
             data.qpos[model.jnt_qposadr[jid]] = value
