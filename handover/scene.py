@@ -40,7 +40,12 @@ class SceneConfig:
     """Geometry and object properties for the handover scene."""
 
     # Base placement. The UR5e sits at the origin; the Gen3 faces it from +x.
-    arm_separation: float = 1.10
+    # 0.85 rather than 1.10. At 1.10 the handover sits at 85-88% of both arms'
+    # reach, so every usable pose is near a limit and the arms crowd each other.
+    # Note this does NOT fix the receiver's joint margin -- that turned out to be
+    # orientation-driven, not distance-driven -- but it does buy back ~10% of
+    # both workspaces, which is what pose randomization needs to spend.
+    arm_separation: float = 0.85
     base_height: float = 0.0
 
     # Object: a graspable cylinder, bottle-sized. Short on purpose -- a long bar
@@ -59,7 +64,7 @@ class SceneConfig:
 
     # Where the object starts, in world coordinates: the giver's grasp pocket,
     # so the static scene matches what the environment builds at reset.
-    obj_init_pos: tuple[float, float, float] = (0.50, -0.02, 0.52)
+    obj_init_pos: tuple[float, float, float] = (0.425, 0.0, 0.50)
 
     # Palm poses for the arm-free validation scene only. Set so the two hands
     # face each other across the object, gripping at different heights.
@@ -86,8 +91,8 @@ class SceneConfig:
     # an arm that starts saturated cannot move in that direction at all. This
     # start leaves 0.72 rad of margin while staying 0.36 m from the handover
     # point, so the approach remains something the policy has to do.
-    giver_start_palm: tuple[float, float, float] = (0.531, -0.037, 0.591)
-    recv_start_palm: tuple[float, float, float] = (0.62, 0.25, 0.55)
+    giver_start_palm: tuple[float, float, float] = (0.456, 0.017, 0.571)
+    recv_start_palm: tuple[float, float, float] = (0.60, 0.24, 0.62)
 
     # Start orientations matter as much as positions: the giver holds from above
     # (palm rolled 180 deg about x, fingers curling down) and the receiver comes
@@ -97,9 +102,11 @@ class SceneConfig:
     # means rotating body +x to point down: +90 deg about y. Derived from the
     # corrected palm-frame pocket, not guessed.
     giver_start_quat: tuple[float, float, float, float] = (0.70710678, 0.0, 0.70710678, 0.0)
-    # From below (-90 about y) with a -90 yaw. Of the four from-below variants
-    # this is the only one the Gen3 reaches without pinning a joint on its stop.
-    recv_start_quat: tuple[float, float, float, float] = (0.5, -0.5, -0.5, -0.5)
+    # From below (-90 about y), yawed 90 and pitched 30. Found by sweeping yaw
+    # and pitch for joint margin: the Gen3's from-below reach is genuinely tight,
+    # and most orientations pin a joint on its stop (margin 0.00). This one
+    # leaves 0.45 rad, against 0.18 for the previous choice.
+    recv_start_quat: tuple[float, float, float, float] = (0.3536, -0.3536, -0.6124, 0.6124)
 
     # Standoff between the arm's tool flange and the Allegro palm. Mounting the
     # hand flush drives the finger proximals ~1 cm into the wrist geoms; real

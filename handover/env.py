@@ -54,12 +54,18 @@ class DomainRandomization:
     """
 
     enabled: bool = True
-    mass_range: tuple[float, float] = (0.7, 1.4)
+
+    # Object mass is deliberately NOT randomized here. It is drawn per scenario
+    # and the giver's grasp is settled under it; scaling it again at reset would
+    # compound the two into a 5x spread and silently break grasps that were
+    # established under a lighter object.
     friction_range: tuple[float, float] = (0.7, 1.3)
     # Contact softness: solref[0] is the time constant, larger being softer.
     solref_range: tuple[float, float] = (0.8, 1.3)
-    # Finger stiffness stands in for tendon slack and actuator variation.
-    hand_gain_range: tuple[float, float] = (0.7, 1.4)
+    # Finger stiffness stands in for tendon slack and actuator variation. Kept
+    # narrow: the snapshot is settled at nominal gain, so a large cut here drops
+    # an object the giver was holding perfectly well a moment earlier.
+    hand_gain_range: tuple[float, float] = (0.88, 1.20)
 
 
 @dataclass
@@ -84,16 +90,34 @@ class EnvConfig:
     # genuinely off the object, and it has to persist -- a threshold crossed for
     # one step is a collision, not a grasp.
     success_load_fraction: float = 0.85
-    success_giver_force: float = 0.15
-    success_hold_steps: int = 25
+    # Was 0.15 N, i.e. the giver had to be carrying under 8% of a 1.96 N object,
+    # sustained for 25 steps. Combined with the receiver's ~9 N grip ceiling that
+    # may simply have been unreachable, and an unreachable bonus is the same as
+    # no bonus at all.
+    success_giver_force: float = 0.40
+    success_hold_steps: int = 15
 
     # --- failure ---
     drop_height: float = 0.25
 
     # --- reward weights ---
-    w_progress: float = 12.0
+    # These three are set against each other deliberately. The progress term
+    # telescopes to w_progress * delta_f, so it is the ENTIRE budget for doing
+    # the transfer; the drop penalty is one-shot. At the previous 12 vs 20, a
+    # policy that completed the whole transfer and then fumbled scored -8 while
+    # standing still scored 0 -- so trying was worse than not trying, and
+    # training correctly settled at "do nothing" (ep_rew_mean plateaued at -5,
+    # exactly -w_drop times the drop rate). Keep w_progress > w_drop.
+    w_progress: float = 25.0
     w_success: float = 50.0
-    w_drop: float = 20.0
+    w_drop: float = 8.0
+
+    # Paid per step while the receiver is carrying. Without it the success bonus
+    # is a cliff: holding the object for 14 steps scores identically to never
+    # touching it. This fills the gap so partial holds register, at a rate small
+    # enough that loitering at f~1 for a whole episode (~20) stays well below
+    # actually completing the handover (~50).
+    w_carry: float = 0.05
     # Potential-based shaping telescopes to w_approach * (total distance closed),
     # so this is the whole budget for discovering the approach -- at 1.5 that was
     # 0.45 for the entire reach, invisible next to a 50-point success bonus. Only
@@ -180,9 +204,34 @@ class EnvConfig:
     # receiver may begin an episode at. Starting sometimes close is what makes
     # the task discoverable: from the full distance the policy has to execute a
     # long directed reach before it ever sees a grasp, so it converges instead on
-    # standing still, which is safe and scores about 22. A snapshot is cached per
-    # entry, so this costs a one-off build rather than per-episode work.
+    # standing still, which is safe and scores about zero.
     start_distance_mix: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
+
+    # ---- episode variety (matches the Isaac baseline's reset randomization) ----
+    #
+    # The giver holds a FIXED pose for the whole episode but a DIFFERENT one each
+    # episode, which is how the baseline worked: only the receiving arm learns,
+    # and the object turns up somewhere new every time. Without this a policy can
+    # memorise one trajectory and look excellent while having generalised nothing.
+    #
+    # Each draw needs its own settled snapshot (the grasp has to be established
+    # under that pose and that object), so a pool is built once at construction
+    # and sampled per episode. That keeps resets at ~0.5 ms instead of ~330 ms.
+    # It is a discrete approximation of continuous randomization: pool_size
+    # distinct scenarios rather than infinitely many. Raise it for more variety
+    # at the cost of a longer one-off build.
+    randomize_start: bool = True
+    start_pool_size: int = 24
+    giver_pos_jitter: tuple[float, float, float] = (0.15, 0.15, 0.10)
+    giver_rot_jitter: float = 0.30
+
+    # Object variety. The baseline paper's headline claim is that a policy
+    # trained on one object transfers to other shapes and sizes; that claim
+    # cannot be made from a single fixed cylinder.
+    randomize_object: bool = True
+    obj_radius_range: tuple[float, float] = (0.026, 0.034)
+    obj_half_length_range: tuple[float, float] = (0.060, 0.095)
+    obj_mass_range: tuple[float, float] = (0.12, 0.30)
 
     # Pre-grasp standoff along the palm's -z. Closest start sits here rather
     # than on the object itself.
@@ -190,7 +239,7 @@ class EnvConfig:
     # closest start off the object, which is geometrically tidier but measured
     # WORSE end to end (0/5 expert successes vs 2/5), so it is left off pending
     # a proper sweep rather than adopted on the strength of the argument.
-    pregrasp_standoff: float = 0.0
+    pregrasp_standoff: float = 0.10
 
     # Whether to put the privileged critic state in the info dict. Off for the
     # single-agent baseline, which does not use it: the array is shipped across
@@ -260,6 +309,9 @@ class HandoverEnv(gym.Env):
         # plus two IK solves -- half the wall time of an entire episode -- and
         # it is deterministic, so paying it per episode is pure waste.
         self._start_snapshots: list[dict[str, np.ndarray]] | None = None
+        # Pool construction uses its own generator so the set of scenarios is the
+        # same across workers; only which one an episode draws differs.
+        self._pool_seed = 12345
         self._step_count = 0
         self._hold_count = 0
         self._prev_fraction = 0.0
@@ -288,10 +340,8 @@ class HandoverEnv(gym.Env):
             self.weight = nom["mass"] * G
             return {}
 
-        mass_scale = float(self._rng.uniform(*dr.mass_range))
-        self.model.body_mass[self.object_body] = nom["mass"] * mass_scale
-        # Load fraction is defined against weight, so it has to track the draw.
-        self.weight = nom["mass"] * mass_scale * G
+        # Mass comes from the scenario, not from this draw.
+        self.weight = nom["mass"] * G
 
         friction_scale = float(self._rng.uniform(*dr.friction_range))
         self.model.geom_friction[self.object_geom] = nom["friction"] * friction_scale
@@ -304,7 +354,6 @@ class HandoverEnv(gym.Env):
         self.model.actuator_biasprm[self._hand_act_ids, 1] = nom["bias"] * gain_scale
 
         return {
-            "dr_mass": mass_scale,
             "dr_friction": friction_scale,
             "dr_solref": solref_scale,
             "dr_hand_gain": gain_scale,
@@ -322,7 +371,22 @@ class HandoverEnv(gym.Env):
         self.data.qpos[self.object_qpos + 3 : self.object_qpos + 7] = quat
         self.data.qvel[self.object_dof : self.object_dof + 6] = 0.0
 
-    def _recv_grasp_palm(self) -> np.ndarray:
+    def _giver_pocket_for(self, palm: np.ndarray, quat: np.ndarray) -> np.ndarray:
+        """Where the object will sit for a given giver palm pose.
+
+        Needed before the scene is built: the receiver's start is defined
+        relative to the object, and with the giver's pose randomized the object
+        is no longer at the nominal spot. Deriving the receiver's start from the
+        nominal position instead puts it in the wrong place entirely -- at the
+        closest start distance, inside the object or nowhere near it.
+        """
+        mat = np.zeros(9)
+        mujoco.mju_quat2Mat(mat, np.asarray(quat, dtype=float))
+        return np.asarray(palm, dtype=float) + mat.reshape(3, 3) @ np.asarray(
+            POCKET_BODY_RIGHT, dtype=float
+        )
+
+    def _recv_grasp_palm(self, obj_pos: np.ndarray | None = None) -> np.ndarray:
         """Nearest sane start: the PRE-GRASP standoff, not the grasp pose itself.
 
         The pocket offset is measured at full closure, but a hand approaching an
@@ -332,7 +396,11 @@ class HandoverEnv(gym.Env):
         which knocks it loose within ~15 steps. Backing off along the palm's -z
         keeps every start on a clean approach line.
         """
-        obj = np.asarray(self.scene_cfg.obj_init_pos, dtype=float)
+        obj = (
+            np.asarray(self.scene_cfg.obj_init_pos, dtype=float)
+            if obj_pos is None
+            else np.asarray(obj_pos, dtype=float)
+        )
         mat = np.zeros(9)
         mujoco.mju_quat2Mat(mat, np.asarray(self.scene_cfg.recv_start_quat, dtype=float))
         rot = mat.reshape(3, 3)
@@ -500,6 +568,11 @@ class HandoverEnv(gym.Env):
 
         # ================= OPTIONAL TERMS (flag-gated) =================
 
+        # Carrying: continuous, so partial holds are worth something.
+        obj_pos_now, _ = self._object_pose()
+        if obj_pos_now[2] > cfg.drop_height:
+            terms["r_carry"] = cfg.w_carry * float(np.clip(fraction, 0.0, 1.0))
+
         # --- object motion penalty ---
         if cfg.use_motion_penalty:
             obj_speed = float(
@@ -585,23 +658,117 @@ class HandoverEnv(gym.Env):
         self.model.actuator_biasprm[self._hand_act_ids, 1] = nom["bias"]
         self.weight = nom["mass"] * G
 
-    def _build_start_snapshot(self, distance: float) -> dict[str, np.ndarray]:
-        """Settle a start state with the receiver `distance` of the way out."""
+    def _grasp_took(self) -> bool:
+        """Is the giver actually holding the object in the current state?"""
+        for _ in range(5):
+            mujoco.mj_step(self.model, self.data)
+        wrenches = self.registry.hand_wrenches(self.data)
+        height = float(self.data.xpos[self.registry.object_body_id][2])
+        return wrenches[GIVER].n_contacts > 0 and height > self.cfg.drop_height
+
+    def _build_pool(self, builder, max_tries: int = 6) -> list[dict]:
+        """Build the scenario pool, keeping only scenarios the giver can hold.
+
+        Some draws are simply not graspable -- a thin object at an awkward wrist
+        angle -- and a snapshot of a failed grasp starts the episode with the
+        object already falling, which reads as the policy dropping it. Rejecting
+        them here keeps that out of the training signal.
+        """
+        pool, rejected = [], 0
+        while len(pool) < max(1, self.cfg.start_pool_size):
+            for _ in range(max_tries):
+                snapshot = self._build_start_snapshot(self._sample_scenario(builder))
+                if self._grasp_took():
+                    pool.append(snapshot)
+                    break
+                rejected += 1
+            else:
+                # Fall back to the un-jittered nominal so the pool always fills.
+                pool.append(self._build_start_snapshot(self._nominal_scenario()))
+        self.pool_rejected = rejected
+        return pool
+
+    def _nominal_scenario(self) -> dict:
+        scene = self.scene_cfg
+        return {
+            "distance": float(self.cfg.start_distance_mix[-1]),
+            "radius": scene.obj_radius,
+            "half_length": scene.obj_half_length,
+            "mass": scene.obj_mass,
+            "giver_palm": np.asarray(scene.giver_start_palm, dtype=float),
+            "giver_quat": np.asarray(scene.giver_start_quat, dtype=float),
+        }
+
+    def _apply_object_params(self, radius: float, half_length: float, mass: float) -> None:
+        """Resize and re-mass the object.
+
+        Geometry is baked at compile time, so mass and inertia do not follow a
+        size change automatically -- they have to be recomputed or the object
+        keeps the inertia of whatever it used to be.
+        """
+        self.model.geom_size[self.object_geom, 0] = radius
+        self.model.geom_size[self.object_geom, 1] = half_length
+        self.model.body_mass[self.object_body] = mass
+        # Solid cylinder about its own axis (local z) and the two transverse axes.
+        transverse = mass * (3.0 * radius**2 + 4.0 * half_length**2) / 12.0
+        axial = 0.5 * mass * radius**2
+        self.model.body_inertia[self.object_body] = [transverse, transverse, axial]
+        self._nominal["mass"] = mass
+
+    def _sample_scenario(self, rng) -> dict:
+        """Draw one episode scenario: giver pose, object, receiver start."""
+        cfg, scene = self.cfg, self.scene_cfg
+        scenario = {
+            "distance": float(rng.choice(cfg.start_distance_mix)),
+            "radius": scene.obj_radius,
+            "half_length": scene.obj_half_length,
+            "mass": scene.obj_mass,
+            "giver_palm": np.asarray(scene.giver_start_palm, dtype=float),
+            "giver_quat": np.asarray(scene.giver_start_quat, dtype=float),
+        }
+        if cfg.randomize_start:
+            scenario["giver_palm"] = scenario["giver_palm"] + rng.uniform(
+                -np.asarray(cfg.giver_pos_jitter), np.asarray(cfg.giver_pos_jitter)
+            )
+            axis = rng.normal(size=3)
+            axis /= np.linalg.norm(axis) + 1e-9
+            angle = float(rng.uniform(-cfg.giver_rot_jitter, cfg.giver_rot_jitter))
+            delta = np.zeros(4)
+            mujoco.mju_axisAngle2Quat(delta, axis, angle)
+            turned = np.zeros(4)
+            mujoco.mju_mulQuat(turned, delta, scenario["giver_quat"])
+            mujoco.mju_normalize4(turned)
+            scenario["giver_quat"] = turned
+        if cfg.randomize_object:
+            scenario["radius"] = float(rng.uniform(*cfg.obj_radius_range))
+            scenario["half_length"] = float(rng.uniform(*cfg.obj_half_length_range))
+            scenario["mass"] = float(rng.uniform(*cfg.obj_mass_range))
+        return scenario
+
+    def _build_start_snapshot(self, scenario: dict) -> dict[str, np.ndarray]:
+        """Settle a start state for one scenario and snapshot it."""
+        self._apply_object_params(
+            scenario["radius"], scenario["half_length"], scenario["mass"]
+        )
+        # Derive the receiver's start from where the object will actually be for
+        # THIS scenario, not from the nominal spawn point.
+        grasp = self._recv_grasp_palm(
+            self._giver_pocket_for(scenario["giver_palm"], scenario["giver_quat"])
+        )
+        nominal = np.asarray(self.scene_cfg.recv_start_palm, dtype=float)
         scene = replace(
             self.scene_cfg,
-            recv_start_palm=tuple(
-                np.asarray(self._recv_grasp_palm(), dtype=float)
-                + distance
-                * (
-                    np.asarray(self.scene_cfg.recv_start_palm, dtype=float)
-                    - np.asarray(self._recv_grasp_palm(), dtype=float)
-                )
-            ),
+            giver_start_palm=tuple(scenario["giver_palm"]),
+            giver_start_quat=tuple(scenario["giver_quat"]),
+            recv_start_palm=tuple(grasp + scenario["distance"] * (nominal - grasp)),
         )
         apply_start_pose(self.model, self.data, scene)
         self.controller.reset(self.data)
         self._establish_giver_grasp()
         return {
+            "radius": scenario["radius"],
+            "half_length": scenario["half_length"],
+            "mass": scenario["mass"],
             "qpos": self.data.qpos.copy(),
             "qvel": self.data.qvel.copy(),
             "ctrl": self.data.ctrl.copy(),
@@ -616,11 +783,13 @@ class HandoverEnv(gym.Env):
         # draw is applied on top and the grasp re-settles in a step or two.
         if self._start_snapshots is None:
             self._randomize_off()
-            self._start_snapshots = [
-                self._build_start_snapshot(d) for d in self.cfg.start_distance_mix
-            ]
+            builder = np.random.default_rng(self._pool_seed)
+            self._start_snapshots = self._build_pool(builder)
 
         snap = self._start_snapshots[int(self._rng.integers(len(self._start_snapshots)))]
+        # The object's size and mass are part of the scenario, so they have to be
+        # restored alongside the state or the snapshot describes a different body.
+        self._apply_object_params(snap["radius"], snap["half_length"], snap["mass"])
         mujoco.mj_resetData(self.model, self.data)
         self.data.qpos[:] = snap["qpos"]
         self.data.qvel[:] = snap["qvel"]
