@@ -15,7 +15,7 @@ the handing robot"* — is what this implements.
 
 ```bash
 python -m venv .venv
-./.venv/bin/pip install mujoco numpy gymnasium stable-baselines3 tensorboard
+./.venv/bin/pip install mujoco numpy gymnasium stable-baselines3 tensorboard wandb
 git clone --depth 1 https://github.com/google-deepmind/mujoco_menagerie.git ~/mujoco_menagerie
 ```
 
@@ -80,6 +80,62 @@ from stage 1:
 ```bash
 ./.venv/bin/python scripts/train.py --giver-mode policy \
     --init-from runs/baseline/final.zip --out runs/stage2
+```
+
+## Running on SLURM
+
+No GPU is requested — MuJoCo steps on CPU and the policy is a small MLP. That
+also means these jobs queue considerably faster than the Isaac ones did.
+
+```bash
+sbatch slurm/train.sbatch                                      # baseline
+sbatch slurm/train.sbatch --use_force_rewards --use_signal_1   # with flags
+sbatch --cpus-per-task=32 slurm/train.sbatch --wandb           # more workers
+```
+
+Anything after the script name is forwarded to `train.py`. Worker count follows
+`--cpus-per-task`. Override defaults with `TIMESTEPS=`, `GIVER_MODE=`,
+`PROJECT_DIR=`, `VENV=`, `MUJOCO_MENAGERIE=`.
+
+The script pins `OMP_NUM_THREADS=1` and friends. This matters: MuJoCo and BLAS
+each grab every core by default, so with N worker processes the node ends up
+massively oversubscribed and throughput collapses. It is the biggest
+performance trap in this setup.
+
+It also deliberately does **not** set `MUJOCO_GL`. Nothing renders, and MuJoCo
+validates the value at import — pointing it at a backend the build lacks makes
+`import mujoco` fail outright on a headless node.
+
+### Sweeping the reward flags
+
+```bash
+bash slurm/sweep.sh --dry-run     # print the sbatch commands
+bash slurm/sweep.sh               # submit
+SEEDS="0 1 2" bash slurm/sweep.sh # three seeds per configuration
+```
+
+Submits the baseline plus one job per experimental term, so any difference is
+attributable to the single flag that changed. Runs share a `--wandb-group` for
+side-by-side comparison.
+
+## Weights & Biases
+
+```bash
+wandb login
+python scripts/train.py --wandb --wandb-project bimanual_handover_mj     --wandb-group my_sweep --wandb-name baseline_s0
+```
+
+Every reward flag and scalar goes into the run config, so a run can be
+identified from its settings rather than its name. `handover/success_rate`,
+`peak_load_fraction`, `drop_rate` and `closest_approach_m` are logged alongside
+the usual PPO curves.
+
+If the compute nodes have no outbound network, set `WANDB_MODE=offline` and
+sync afterwards from the login node:
+
+```bash
+WANDB_MODE=offline sbatch slurm/train.sbatch --wandb
+wandb sync wandb/offline-run-*      # later, from a node with network
 ```
 
 ## Validation gates

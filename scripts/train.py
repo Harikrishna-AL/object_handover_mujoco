@@ -140,12 +140,40 @@ def main():
                     help="stage 1 uses 'scripted'; stage 2 unfreezes the giver")
     ap.add_argument("--init-from", type=str, default=None,
                     help="checkpoint to warm-start from (for stage 2)")
+    ap.add_argument("--wandb", action="store_true", help="log to Weights & Biases")
+    ap.add_argument("--wandb-project", type=str, default="bimanual_handover_mj")
+    ap.add_argument("--wandb-entity", type=str, default=None)
+    ap.add_argument("--wandb-name", type=str, default=None)
+    ap.add_argument("--wandb-group", type=str, default=None,
+                    help="groups related runs, e.g. one sweep over reward flags")
     add_reward_args(ap)
     args = ap.parse_args()
 
     env_cfg = env_config_from_args(args, args.giver_mode)
     active = [f for f in REWARD_FLAGS if getattr(args, f)]
+    reward_label = "baseline" if not active else "baseline+" + "+".join(active)
     print("reward: baseline" + (f" + {', '.join(active)}" if active else " only (no flags)"))
+
+    run = None
+    if args.wandb:
+        import wandb
+        from wandb.integration.sb3 import WandbCallback
+
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name or f"{reward_label}_{args.giver_mode}_s{args.seed}",
+            group=args.wandb_group,
+            # Every reward flag and scalar goes into the config, so a run can be
+            # identified from its settings alone rather than from its name.
+            config={
+                **vars(args),
+                "reward_label": reward_label,
+                "active_reward_flags": active,
+            },
+            sync_tensorboard=True,
+            save_code=True,
+        )
 
     os.makedirs(args.out, exist_ok=True)
 
@@ -195,6 +223,8 @@ def main():
             save_vecnormalize=True,
         ),
     ]
+    if run is not None:
+        callbacks.append(WandbCallback(verbose=0))
 
     start = time.perf_counter()
     model.learn(total_timesteps=args.timesteps, callback=callbacks, progress_bar=False)
@@ -204,6 +234,8 @@ def main():
     venv.save(os.path.join(args.out, "vecnormalize.pkl"))
     print(f"\ndone in {elapsed/60:.1f} min ({args.timesteps/elapsed:.0f} steps/s)")
     venv.close()
+    if run is not None:
+        run.finish()
 
 
 if __name__ == "__main__":

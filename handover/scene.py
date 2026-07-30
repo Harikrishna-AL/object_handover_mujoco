@@ -19,7 +19,10 @@ import numpy as np
 
 from .ik import ArmIK
 
-MENAGERIE = os.path.expanduser("~/mujoco_menagerie")
+# Overridable so cluster jobs can point at a shared or scratch copy.
+MENAGERIE = os.environ.get(
+    "MUJOCO_MENAGERIE", os.path.expanduser("~/mujoco_menagerie")
+)
 
 UR5E_XML = f"{MENAGERIE}/universal_robots_ur5e/ur5e.xml"
 GEN3_XML = f"{MENAGERIE}/kinova_gen3/gen3.xml"
