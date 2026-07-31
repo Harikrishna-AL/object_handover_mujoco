@@ -193,6 +193,21 @@ headless node try `MUJOCO_GL=egl`, and if the build lacks EGL just record
 locally -- nothing in training renders, so this is a debugging tool rather than
 part of a run.
 
+## Reading a finished run
+
+Everything the training script prints is also written to the run directory, so
+a lost terminal costs nothing:
+
+```bash
+python scripts/summarize.py runs/valley4
+python scripts/summarize.py runs/*/ --rows 30      # compare runs
+tensorboard --logdir runs/                          # or the full curves
+```
+
+It prints the metrics that answer the questions in order -- is the receiver
+reaching, is it holding, is it dropping, is it scoring -- plus a first-decile
+against last-decile comparison, which is what "did it improve" actually means.
+
 ## Validation gates
 
 | script | checks |
