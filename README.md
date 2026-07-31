@@ -162,8 +162,27 @@ wandb sync wandb/offline-run-*      # later, from a node with network
 ## Watching it
 
 ```bash
-python scripts/record.py --policy expert --start-distance 0.25 --out handover.mp4
-python scripts/record.py --policy checkpoint --checkpoint runs/baseline/final.zip
+# several episodes in one video, with a verdict banner held at each ending
+python scripts/record.py --policy expert --episodes 6 --out handover.mp4
+python scripts/record.py --policy random --episodes 6 --out random.mp4
+
+# a trained checkpoint (vecnormalize.pkl is picked up from beside it)
+python scripts/record.py --policy checkpoint --episodes 6 \
+    --checkpoint runs/baseline/final.zip
+```
+
+`--episodes N` matters more than it sounds: a failure is often over in twenty
+steps, so a single episode is a blink. `--freeze` holds the last frame with the
+verdict on it.
+
+**Replaying an older checkpoint.** The observation dimension has not changed
+across the geometry work, so an old checkpoint loads without complaint -- but
+observations carry world-frame positions, and moving the arm bases puts every
+input out of distribution. Replay under the geometry it was trained on:
+
+```bash
+python scripts/record.py --policy checkpoint --checkpoint old/final.zip \
+    --arm-separation 1.10 --no-randomize --episodes 6
 ```
 
 Load fraction, both grip forces and object height are burned into each frame.

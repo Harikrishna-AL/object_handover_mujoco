@@ -100,6 +100,11 @@ def main():
     ap.add_argument("--height", type=int, default=720)
     ap.add_argument("--fps", type=int, default=25)
     ap.add_argument("--every", type=int, default=2, help="record every Nth control step")
+    ap.add_argument("--episodes", type=int, default=1,
+                    help="record this many consecutive episodes into one video")
+    ap.add_argument("--freeze", type=int, default=12,
+                    help="frames to hold on each episode's final state, so a 20-step "
+                         "drop is actually visible rather than a blink")
     ap.add_argument("--seed", type=int, default=0)
     # Scene overrides, for replaying a checkpoint under the geometry it was
     # trained on. A policy sees palm and object positions in world coordinates,
@@ -157,55 +162,73 @@ def main():
             print("WARNING: no vecnormalize.pkl found. If this checkpoint was trained "
                   "with normalize_input the rollout below is meaningless.")
 
-    obs, _ = env.reset(seed=args.seed)
-    set_env_flag(env, "reached_standoff", False)
-    script = ScriptCfg()
-    rng = np.random.default_rng(args.seed)
-
     renderer = mujoco.Renderer(env.model, args.height, args.width)
     camera = make_camera(env)
     camera.azimuth, camera.elevation, camera.distance = (
         args.azimuth, args.elevation, args.distance)
+
+    script = ScriptCfg()
+    rng = np.random.default_rng(args.seed)
     frames = []
+    outcomes = []
 
-    for step in range(env.cfg.episode_steps):
-        if args.policy == "expert":
-            action = expert_action(env, step, script)
-        elif args.policy == "hold":
-            action = np.zeros(env.controller.action_dim)
-        elif args.policy == "random":
-            action = rng.uniform(-1, 1, env.controller.action_dim)
-        else:
-            model_obs = obs
-            if obs_rms is not None:
-                model_obs = np.clip(
-                    (obs - obs_rms.mean) / np.sqrt(obs_rms.var + 1e-8), -10.0, 10.0
-                ).astype(np.float32)
-            action, _ = policy.predict(model_obs, deterministic=True)
+    for episode in range(max(1, args.episodes)):
+        obs, _ = env.reset(seed=args.seed + episode)
+        set_env_flag(env, "reached_standoff", False)
+        info = {}
 
-        obs, reward, terminated, truncated, info = env.step(action)
+        for step in range(env.cfg.episode_steps):
+            if args.policy == "expert":
+                action = expert_action(env, step, script)
+            elif args.policy == "hold":
+                action = np.zeros(env.controller.action_dim)
+            elif args.policy == "random":
+                action = rng.uniform(-1, 1, env.controller.action_dim)
+            else:
+                model_obs = obs
+                if obs_rms is not None:
+                    model_obs = np.clip(
+                        (obs - obs_rms.mean) / np.sqrt(obs_rms.var + 1e-8), -10.0, 10.0
+                    ).astype(np.float32)
+                action, _ = policy.predict(model_obs, deterministic=True)
 
-        if step % args.every == 0:
-            renderer.update_scene(env.data, camera=camera)
-            frames.append(
-                annotate(
-                    renderer.render(),
-                    [
-                        f"t:{step:04d}",
-                        f"f:{info['load_fraction']:6.2f}",
-                        f"g:{info['giver_grip']:6.2f}N",
-                        f"r:{info['recv_grip']:6.2f}N",
-                        f"z:{info['object_height']:5.3f}",
-                    ],
+            obs, reward, terminated, truncated, info = env.step(action)
+
+            if step % args.every == 0:
+                renderer.update_scene(env.data, camera=camera)
+                frames.append(
+                    annotate(
+                        renderer.render(),
+                        [
+                            f"ep:{episode + 1}/{args.episodes}",
+                            f"t:{step:04d}",
+                            f"f:{info['load_fraction']:6.2f}",
+                            f"g:{info['giver_grip']:6.2f}N",
+                            f"r:{info['recv_grip']:6.2f}N",
+                            f"z:{info['object_height']:5.3f}",
+                        ],
+                    )
                 )
-            )
 
-        if terminated or truncated:
-            break
+            if terminated or truncated:
+                break
 
-    outcome = "SUCCESS" if info["success"] else ("DROPPED" if info["dropped"] else "timeout")
-    print(f"{args.policy}: {step + 1} steps, {outcome}, "
-          f"peak load fraction {info['load_fraction']:.2f}")
+        outcome = ("SUCCESS" if info.get("success")
+                   else "DROPPED" if info.get("dropped") else "timeout")
+        outcomes.append(outcome)
+        print(f"  episode {episode + 1}: {step + 1} steps, {outcome}, "
+              f"f={info.get('load_fraction', 0):.2f}")
+
+        # Hold on the final state with the verdict, so a 20-step drop reads as an
+        # event rather than a flicker.
+        renderer.update_scene(env.data, camera=camera)
+        last = annotate(renderer.render(),
+                        [f"ep:{episode + 1}/{args.episodes}", outcome.lower()])
+        frames.extend([last] * max(0, args.freeze))
+
+    tally = {o: outcomes.count(o) for o in sorted(set(outcomes))}
+    print(f"{args.policy}: {len(outcomes)} episodes -> " +
+          ", ".join(f"{v} {k.lower()}" for k, v in tally.items()))
 
     if args.out.endswith(".gif"):
         imageio.mimsave(args.out, frames, duration=1.0 / args.fps, loop=0)
