@@ -109,6 +109,20 @@ class EnvConfig:
     # training correctly settled at "do nothing" (ep_rew_mean plateaued at -5,
     # exactly -w_drop times the drop rate). Keep w_progress > w_drop.
     w_progress: float = 25.0
+
+    # Progress is measured on a SMOOTHED load fraction, not the instantaneous
+    # one. Raw f is clipped to [0, 1] for the progress term, so a single violent
+    # step where the receiver strikes the object -- f was observed peaking at 20,
+    # i.e. twenty times the object's weight -- registers as a completed transfer
+    # and pays the whole w_progress. With the drop penalty at 8 that made
+    # "slam the object, collect +25, eat the -8" worth +14.5 against 0 for doing
+    # nothing: a reward hack that teaches exactly the opposite of a gentle
+    # handover. (Under the earlier 12/20 weights the same exploit scored -18,
+    # which is why it stayed latent until the valley was fixed.)
+    #
+    # An exponential average with this coefficient pays ~1.25 for a one-step
+    # spike and the full 25 only for load genuinely held over ~60 steps.
+    progress_smoothing: float = 0.05
     w_success: float = 50.0
     w_drop: float = 8.0
 
@@ -331,6 +345,7 @@ class HandoverEnv(gym.Env):
         self._hold_count = 0
         self._prev_fraction = 0.0
         self._prev_potential = 0.0
+        self._f_smooth = 0.0
         self._prev_contacts = {GIVER: 0, RECV: 0}
         self._prev_grip = {GIVER: 0.0, RECV: 0.0}
 
@@ -567,8 +582,12 @@ class HandoverEnv(gym.Env):
 
         # Progress along the transfer. Rewarding the increase rather than the
         # level keeps the policy from parking at a comfortable split.
-        progress = float(np.clip(fraction, 0.0, 1.0) - np.clip(self._prev_fraction, 0.0, 1.0))
-        terms["r_progress"] = cfg.w_progress * progress
+        clipped = float(np.clip(fraction, 0.0, 1.0))
+        smoothed = (
+            self._f_smooth + cfg.progress_smoothing * (clipped - self._f_smooth)
+        )
+        terms["r_progress"] = cfg.w_progress * (smoothed - self._f_smooth)
+        self._f_smooth = smoothed
 
         # Approach shaping, potential-based: gamma*phi(s') - phi(s).
         #
@@ -830,6 +849,7 @@ class HandoverEnv(gym.Env):
         wrenches = self.registry.hand_wrenches(self.data)
         self._prev_fraction = load_fraction(wrenches, self.weight)
         self._prev_potential = self._potential(self._object_pose()[0])
+        self._f_smooth = 0.0
         for side, w in wrenches.items():
             self._prev_contacts[side] = w.n_contacts
             self._prev_grip[side] = w.grip
@@ -886,6 +906,7 @@ class HandoverEnv(gym.Env):
 
         info = {
             "load_fraction": fraction,
+            "load_fraction_smooth": self._f_smooth,
             "giver_grip": wrenches[GIVER].grip,
             "recv_grip": wrenches[RECV].grip,
             "giver_load_z": wrenches[GIVER].load_vertical,
