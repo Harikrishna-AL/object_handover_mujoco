@@ -249,6 +249,10 @@ class EnvConfig:
     # It is a discrete approximation of continuous randomization: pool_size
     # distinct scenarios rather than infinitely many. Raise it for more variety
     # at the cost of a longer one-off build.
+    # A pool scenario is only kept if the giver genuinely carries the object.
+    grasp_carry_low: float = 0.80
+    grasp_carry_high: float = 1.30
+
     randomize_start: bool = True
     start_pool_size: int = 24
     giver_pos_jitter: tuple[float, float, float] = (0.15, 0.15, 0.10)
@@ -259,7 +263,7 @@ class EnvConfig:
     # cannot be made from a single fixed cylinder.
     randomize_object: bool = True
     obj_radius_range: tuple[float, float] = (0.026, 0.034)
-    obj_half_length_range: tuple[float, float] = (0.060, 0.095)
+    obj_half_length_range: tuple[float, float] = (0.095, 0.130)
     obj_mass_range: tuple[float, float] = (0.12, 0.30)
 
     # Pre-grasp standoff along the palm's -z. Closest start sits here rather
@@ -269,6 +273,13 @@ class EnvConfig:
     # WORSE end to end (0/5 expert successes vs 2/5), so it is left off pending
     # a proper sweep rather than adopted on the strength of the argument.
     pregrasp_standoff: float = 0.10
+
+    # How far along the object's own axis each hand grips, measured from the
+    # object's centre. The baseline holds the rod near one end and puts the
+    # receiver's target 17.5 cm away along it; the gap between these two numbers
+    # is what stops the two hands contesting the same volume.
+    giver_grip_offset: float = 0.060
+    recv_grip_offset: float = 0.080
 
     # Whether to put the privileged critic state in the info dict. Off for the
     # single-agent baseline, which does not use it: the array is shipped across
@@ -456,9 +467,25 @@ class HandoverEnv(gym.Env):
         space and hoping the giver catches it would make every episode start
         with a different, mostly failed, precondition.
         """
-        target = self._grip_point(GIVER)
-        _, obj_quat = self._object_pose()
-        obj_quat = np.asarray(self.scene_cfg.obj_quat, dtype=float)
+        # Orient the rod to the GIVER'S PALM, not to the world.
+        #
+        # The Allegro's fingers spread along the palm's y and curl in its x-z
+        # plane, so a cylinder is only properly wrapped when its axis lies along
+        # the palm's y. A world-fixed spawn orientation means that alignment
+        # changes with every randomized giver pose: measured, a horizontal rod
+        # lost half its weight to something else, and a vertical one spawned
+        # inside the fingers and produced 82 N across 24 contacts.
+        _, palm_quat = self.controller.arms[GIVER].palm_pose(self.data)
+        to_palm_y = np.zeros(4)
+        mujoco.mju_axisAngle2Quat(to_palm_y, np.array([1.0, 0.0, 0.0]), -np.pi / 2)
+        obj_quat = np.zeros(4)
+        mujoco.mju_mulQuat(obj_quat, palm_quat, to_palm_y)
+        mujoco.mju_normalize4(obj_quat)
+
+        mat = np.zeros(9)
+        mujoco.mju_quat2Mat(mat, obj_quat)
+        spawn_axis = mat.reshape(3, 3)[:, 2]
+        target = self._grip_point(GIVER) + self.cfg.giver_grip_offset * spawn_axis
 
         # Drive the grip rate hard positive for the giver and hard negative for
         # the receiver; the rate limiter saturates them at 1 and 0 respectively.
@@ -473,7 +500,7 @@ class HandoverEnv(gym.Env):
             self._set_object_pose(target, obj_quat)
             self.controller.compensate_gravity(self.data)
             mujoco.mj_step(self.model, self.data)
-            target = self._grip_point(GIVER)
+            target = self._grip_point(GIVER) + self.cfg.giver_grip_offset * spawn_axis
 
         for _ in range(self.cfg.settle_free_steps):
             self.controller.apply(self.data, action)
@@ -526,13 +553,33 @@ class HandoverEnv(gym.Env):
 
     # ---------------------------------------------------------------- reward
 
+    def _object_axis(self, away_from_giver: bool = True) -> np.ndarray:
+        """The rod's long axis in world coordinates (its own local z).
+
+        The sign is resolved against where the giver is actually holding, so it
+        points toward the FREE end. A fixed sign flips meaning as soon as the rod
+        rotates, which sends the receiver at the end the giver is already on.
+        """
+        obj_pos, obj_quat = self._object_pose()
+        mat = np.zeros(9)
+        mujoco.mju_quat2Mat(mat, obj_quat)
+        axis = mat.reshape(3, 3)[:, 2]
+        if away_from_giver and np.dot(obj_pos - self._grip_point(GIVER), axis) < 0:
+            axis = -axis
+        return axis
+
     def _grasp_target(self) -> tuple[np.ndarray, np.ndarray]:
-        """Pose the receiver's palm must reach to grasp the object where it is."""
+        """Pose the receiver's palm must reach to grasp the object.
+
+        Aimed at a point along the rod offset from where the giver holds it, so
+        the receiver has bare object to close on instead of the giver's fingers.
+        """
         obj_pos, _ = self._object_pose()
+        grip_point = obj_pos + self.cfg.recv_grip_offset * self._object_axis()
         quat = np.asarray(self.scene_cfg.recv_start_quat, dtype=float)
         mat = np.zeros(9)
         mujoco.mju_quat2Mat(mat, quat)
-        return obj_pos - mat.reshape(3, 3) @ np.asarray(POCKET_BODY_LEFT, dtype=float), quat
+        return grip_point - mat.reshape(3, 3) @ np.asarray(POCKET_BODY_LEFT, dtype=float), quat
 
     def approach_error(self) -> tuple[float, float, float]:
         """(total, translation, rotation) error to the receiver's grasp pose."""
@@ -694,14 +741,26 @@ class HandoverEnv(gym.Env):
         self.weight = nom["mass"] * G
 
     def _grasp_took(self) -> bool:
-        """Is the giver actually holding the object in the current state?"""
-        for _ in range(5):
+        """Is the giver actually CARRYING the object, not merely touching it?
+
+        Checking contact and height alone is too permissive: an off-centre grip
+        on a heavier rod can keep a few contacts while the rod pivots onto
+        something else, and those scenarios then begin an episode already half
+        failed. Requiring the giver's vertical load to account for most of the
+        weight rejects them at pool-build time instead.
+        """
+        for _ in range(8):
             mujoco.mj_step(self.model, self.data)
         wrenches = self.registry.hand_wrenches(self.data)
         height = float(self.data.xpos[self.registry.object_body_id][2])
-        return wrenches[GIVER].n_contacts > 0 and height > self.cfg.drop_height
+        carried = wrenches[GIVER].load_vertical / max(self.weight, 1e-6)
+        return (
+            wrenches[GIVER].n_contacts >= 3
+            and height > self.cfg.drop_height
+            and self.cfg.grasp_carry_low < carried < self.cfg.grasp_carry_high
+        )
 
-    def _build_pool(self, builder, max_tries: int = 6) -> list[dict]:
+    def _build_pool(self, builder, max_tries: int = 12) -> list[dict]:
         """Build the scenario pool, keeping only scenarios the giver can hold.
 
         Some draws are simply not graspable -- a thin object at an awkward wrist

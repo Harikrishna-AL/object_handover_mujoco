@@ -53,7 +53,18 @@ class SceneConfig:
     # The diameter must exceed the Allegro's 4.9 cm minimum grip opening or the
     # fingers close on empty air and never generate force.
     obj_radius: float = 0.030
-    obj_half_length: float = 0.075
+    # 22 cm long. Length is not cosmetic: the giver grips off-centre and the
+    # receiver takes the far end, so the rod's length IS the clearance between
+    # the two hands. At 15 cm gripped centrally the only graspable region was the
+    # one the giver's fingers already occupied, and every approach was a
+    # collision by construction -- the real cause of the persistent drops.
+    #
+    # The baseline uses 35 cm, but its object weighs 0.25 g. Ours has real mass,
+    # so an off-centre grip on a 35 cm rod applies a torque the Allegro cannot
+    # hold: measured, the giver retained only 33-58% of the weight, the rest
+    # going into whatever the rod pivoted onto. Swept against grasp stability,
+    # 22 cm holds 99% of mg on 9 contacts while still leaving 12 cm of bare rod.
+    obj_half_length: float = 0.110
     obj_mass: float = 0.200
     obj_friction: tuple[float, float, float] = (1.0, 0.005, 0.0001)
 
