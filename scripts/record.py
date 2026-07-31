@@ -101,12 +101,34 @@ def main():
     ap.add_argument("--fps", type=int, default=25)
     ap.add_argument("--every", type=int, default=2, help="record every Nth control step")
     ap.add_argument("--seed", type=int, default=0)
+    # Scene overrides, for replaying a checkpoint under the geometry it was
+    # trained on. A policy sees palm and object positions in world coordinates,
+    # so moving the arm bases puts every observation out of distribution and the
+    # rollout tells you nothing about how the policy actually learned.
+    ap.add_argument("--arm-separation", type=float, default=None,
+                    help="override arm separation, e.g. 1.10 for pre-62f1c46 checkpoints")
+    ap.add_argument("--no-randomize", action="store_true",
+                    help="fixed giver pose and object, as before episode randomization")
     args = ap.parse_args()
 
-    cfg = EnvConfig()
+    from dataclasses import replace as _replace
+
+    from handover.scene import SceneConfig
+
+    kwargs = {}
     if args.start_distance is not None:
-        cfg = EnvConfig(start_distance_mix=(args.start_distance,))
-    env = HandoverEnv(cfg)
+        kwargs["start_distance_mix"] = (args.start_distance,)
+    if args.no_randomize:
+        kwargs["randomize_start"] = False
+        kwargs["randomize_object"] = False
+    cfg = EnvConfig(**kwargs)
+
+    scene_cfg = SceneConfig()
+    if args.arm_separation is not None:
+        scene_cfg = _replace(scene_cfg, arm_separation=args.arm_separation)
+        print(f"scene override: arm_separation={args.arm_separation}")
+
+    env = HandoverEnv(cfg, scene_cfg=scene_cfg)
 
     policy, obs_rms = None, None
     if args.policy == "checkpoint":
