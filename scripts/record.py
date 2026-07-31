@@ -114,13 +114,20 @@ def main():
                     help="override arm separation, e.g. 1.10 for pre-62f1c46 checkpoints")
     ap.add_argument("--no-randomize", action="store_true",
                     help="fixed giver pose and object, as before episode randomization")
+    # MUST match how the checkpoint was trained. EnvConfig defaults to "policy"
+    # while training defaults to "scripted", so leaving this unset replays a
+    # stage-1 policy with its giver actions live -- and those were overridden by
+    # the curriculum throughout training, so they are untrained noise. The giver
+    # then flails and the video looks far worse than the policy actually is.
+    ap.add_argument("--giver-mode", choices=["policy", "scripted"], default="scripted",
+                    help="stage 1 checkpoints are 'scripted'; use 'policy' for stage 2")
     args = ap.parse_args()
 
     from dataclasses import replace as _replace
 
     from handover.scene import SceneConfig
 
-    kwargs = {}
+    kwargs = {"giver_mode": args.giver_mode}
     if args.start_distance is not None:
         kwargs["start_distance_mix"] = (args.start_distance,)
     if args.no_randomize:
@@ -134,6 +141,9 @@ def main():
         print(f"scene override: arm_separation={args.arm_separation}")
 
     env = HandoverEnv(cfg, scene_cfg=scene_cfg)
+    print(f"giver_mode={args.giver_mode}"
+          + ("  (giver held by the curriculum, only the receiver is learned)"
+             if args.giver_mode == "scripted" else "  (both arms driven by the policy)"))
 
     policy, obs_rms = None, None
     if args.policy == "checkpoint":
