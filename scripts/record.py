@@ -87,7 +87,9 @@ def main():
     ap.add_argument("--policy", choices=["expert", "hold", "random", "checkpoint"],
                     default="expert")
     ap.add_argument("--checkpoint", type=str, default=None)
-    ap.add_argument("--vecnormalize", type=str, default=None)
+    ap.add_argument("--vecnormalize", type=str, default=None,
+                    help="vecnormalize.pkl saved beside the checkpoint; REQUIRED for a "
+                         "checkpoint trained with observation normalization")
     ap.add_argument("--out", type=str, default="handover.mp4")
     ap.add_argument("--azimuth", type=float, default=135.0)
     ap.add_argument("--elevation", type=float, default=-18.0)
@@ -106,13 +108,32 @@ def main():
         cfg = EnvConfig(start_distance_mix=(args.start_distance,))
     env = HandoverEnv(cfg)
 
-    policy = None
+    policy, obs_rms = None, None
     if args.policy == "checkpoint":
         if not args.checkpoint:
             ap.error("--policy checkpoint needs --checkpoint")
         from stable_baselines3 import PPO
 
         policy = PPO.load(args.checkpoint, device="cpu")
+
+        # Training wraps the env in VecNormalize, so the policy expects
+        # normalized observations. Feeding it raw ones produces garbage that
+        # looks exactly like a policy that failed to learn -- so this warns
+        # loudly rather than silently misleading you.
+        guess = args.vecnormalize
+        if guess is None:
+            beside = os.path.join(os.path.dirname(os.path.abspath(args.checkpoint)),
+                                  "vecnormalize.pkl")
+            guess = beside if os.path.exists(beside) else None
+        if guess:
+            import pickle
+
+            with open(guess, "rb") as fh:
+                obs_rms = pickle.load(fh).obs_rms
+            print(f"using observation normalization from {guess}")
+        else:
+            print("WARNING: no vecnormalize.pkl found. If this checkpoint was trained "
+                  "with normalize_input the rollout below is meaningless.")
 
     obs, _ = env.reset(seed=args.seed)
     set_env_flag(env, "reached_standoff", False)
@@ -133,7 +154,12 @@ def main():
         elif args.policy == "random":
             action = rng.uniform(-1, 1, env.controller.action_dim)
         else:
-            action, _ = policy.predict(obs, deterministic=True)
+            model_obs = obs
+            if obs_rms is not None:
+                model_obs = np.clip(
+                    (obs - obs_rms.mean) / np.sqrt(obs_rms.var + 1e-8), -10.0, 10.0
+                ).astype(np.float32)
+            action, _ = policy.predict(model_obs, deterministic=True)
 
         obs, reward, terminated, truncated, info = env.step(action)
 
