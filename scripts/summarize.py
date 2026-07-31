@@ -36,15 +36,27 @@ SHORT = {
 }
 
 
+def find_runs(run_dir: str) -> list[str]:
+    """Every distinct training run under `run_dir`.
+
+    Stable Baselines does not overwrite a log directory -- it adds PPO_1, PPO_2,
+    and so on. Globbing all event files and merging them silently interleaves
+    separate runs into one nonsense series, which is exactly what this did
+    before. Each event file is its own run.
+    """
+    files = glob.glob(os.path.join(run_dir, "**", "events.out.tfevents*"), recursive=True)
+    return sorted({os.path.dirname(f) for f in files})
+
+
 def read_scalars(run_dir: str) -> dict[str, list[tuple[int, float]]]:
-    """Pull scalar series out of every event file under `run_dir`."""
+    """Pull scalar series out of the event files in exactly this directory."""
     try:
         from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
     except ImportError:
         sys.exit("tensorboard is not installed: pip install tensorboard")
 
     series: dict[str, list[tuple[int, float]]] = {}
-    files = glob.glob(os.path.join(run_dir, "**", "events.out.tfevents*"), recursive=True)
+    files = glob.glob(os.path.join(run_dir, "events.out.tfevents*"))
     if not files:
         return series
 
@@ -101,8 +113,17 @@ def main():
     ap.add_argument("runs", nargs="+")
     ap.add_argument("--rows", type=int, default=20)
     args = ap.parse_args()
-    for run in args.runs:
-        summarize(run.rstrip("/"), args.rows)
+    for root in args.runs:
+        root = root.rstrip("/")
+        found = find_runs(root)
+        if not found:
+            print(f"{root}: no event files found")
+            continue
+        if len(found) > 1:
+            print(f"\n{root}: {len(found)} separate runs in this directory "
+                  f"(later ones are more recent)")
+        for run in found:
+            summarize(run, args.rows)
 
 
 if __name__ == "__main__":
