@@ -86,7 +86,11 @@ def residual_report(model, data, reg, cfg):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--kp", type=float, default=1.0, help="Allegro position gain")
-    ap.add_argument("--closure", type=float, default=0.85, help="grip closure, 0=open 1=closed")
+    ap.add_argument("--closure", type=float, default=1.0,
+                    help="grip closure, 0=open 1=closed. Full closure is needed: the "
+                         "22 cm rod is heavier and higher-inertia than the 15 cm one this "
+                         "defaulted to at 0.85, and a partial grip loses it the moment the "
+                         "giver lets go (transfer reaches f=0.80 then collapses)")
     ap.add_argument("--mass", type=float, default=0.200)
     ap.add_argument("--retract", type=float, default=0.12,
                     help="how far the receiver starts clear of the object (m)")
