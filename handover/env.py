@@ -133,6 +133,21 @@ class EnvConfig:
     #               the comparison the baseline paper makes.
     approach_metric: str = "dq"
 
+    # Ceiling on the pose error the approach potential can see.
+    #
+    # The potential tracks the LIVE object, so when the object is dropped the
+    # error explodes (0.11 -> 0.8 as it falls) and the telescoped shaping fires
+    # a -5 to -15 hit on top of the -8 drop penalty. Measured: dropped episodes
+    # were costing -13 to -22, so the effective drop cost was two to three times
+    # what w_drop says, and the "trying is worse than standing still" valley came
+    # straight back. It also violates the condition potential-based shaping needs
+    # to be policy-preserving -- the potential must vanish at terminal states,
+    # and an unbounded one is as far from that as possible.
+    #
+    # Clamping keeps the full gradient inside the working range (start errors run
+    # 0.045-0.173) and stops a falling object from dominating the return.
+    approach_error_cap: float = 0.25
+
     # ---- optional reward terms, all OFF by default ----
     #
     # Same structure as the Isaac environment: with no flags set the reward is
@@ -520,7 +535,8 @@ class HandoverEnv(gym.Env):
         can arrive at the right point facing the wrong way and never grasp.
         Under "dq" this is the baseline's combined pose metric.
         """
-        return -self.cfg.w_approach * self.approach_error()[0]
+        error = min(self.approach_error()[0], self.cfg.approach_error_cap)
+        return -self.cfg.w_approach * error
 
     def _palm_speed(self, side: str) -> float:
         """Linear speed of one hand's palm, in world coordinates."""
