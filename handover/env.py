@@ -130,6 +130,20 @@ class EnvConfig:
     # An exponential average with this coefficient pays ~1.25 for a one-step
     # spike and the full 25 only for load genuinely held over ~60 steps.
     progress_smoothing: float = 0.05
+
+    # Carrying is f ~ 1. Anything far above is an impact, not a grasp.
+    #
+    # clip(f, 0, 1) makes f = 29 and f = 1 identical to the reward, so a policy
+    # that hammers the rod collects the same credit as one holding it. Smoothing
+    # alone does not help: it stops a single spike paying in full, but the moving
+    # average of clip(f) climbs just the same under repeated impacts (measured
+    # EMA 0.46, worth +11.6). Training duly found it -- peak load fraction rose
+    # 12.8 -> 29.3 across a run while episode return went positive.
+    #
+    # Decaying above the overshoot threshold makes the reward express what the
+    # task actually wants: support the weight, do not strike the object.
+    carry_overshoot_start: float = 1.3
+    carry_overshoot_decay: float = 2.0
     w_success: float = 50.0
     w_drop: float = 8.0
 
@@ -597,6 +611,16 @@ class HandoverEnv(gym.Env):
             return translation, translation, 0.0
         return pose_distance(palm_pos, palm_quat, target_pos, target_quat)
 
+    def _carry_quality(self, fraction: float) -> float:
+        """How much of the object's weight is being CARRIED, in [0, 1].
+
+        Peaks when the receiver supports about one object weight and falls away
+        for impacts, so striking the rod cannot earn what holding it earns.
+        """
+        held = float(np.clip(fraction, 0.0, 1.0))
+        overshoot = max(0.0, fraction - self.cfg.carry_overshoot_start)
+        return held * float(np.exp(-self.cfg.carry_overshoot_decay * overshoot))
+
     def _potential(self, obj_pos: np.ndarray) -> float:
         """Shaping potential: closer to the grasp POSE is better.
 
@@ -636,7 +660,7 @@ class HandoverEnv(gym.Env):
 
         # Progress along the transfer. Rewarding the increase rather than the
         # level keeps the policy from parking at a comfortable split.
-        clipped = float(np.clip(fraction, 0.0, 1.0))
+        clipped = self._carry_quality(fraction)
         smoothed = (
             self._f_smooth + cfg.progress_smoothing * (clipped - self._f_smooth)
         )
@@ -660,7 +684,7 @@ class HandoverEnv(gym.Env):
         # Carrying: continuous, so partial holds are worth something.
         obj_pos_now, _ = self._object_pose()
         if obj_pos_now[2] > cfg.drop_height:
-            terms["r_carry"] = cfg.w_carry * float(np.clip(fraction, 0.0, 1.0))
+            terms["r_carry"] = cfg.w_carry * self._carry_quality(fraction)
 
         # --- object motion penalty ---
         if cfg.use_motion_penalty:
