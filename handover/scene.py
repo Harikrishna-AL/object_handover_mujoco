@@ -34,6 +34,10 @@ ALLEGRO_LEFT_XML = f"{MENAGERIE}/wonik_allegro/left_hand.xml"
 GIVER = "giver_"
 RECV = "recv_"
 
+# Floor values for arm joint rotor inertia and damping. See _ensure_joint_inertia.
+ARM_ARMATURE = 0.1
+ARM_DAMPING = 0.1
+
 
 @dataclass
 class SceneConfig:
@@ -141,6 +145,29 @@ def _strip_keyframes(spec: mujoco.MjSpec) -> None:
         spec.delete(key)
 
 
+def _ensure_joint_inertia(spec: mujoco.MjSpec, armature: float, damping: float) -> None:
+    """Give arm joints rotor inertia and damping if the model omits them.
+
+    Menagerie's Gen3 sets neither, while its UR5e uses armature 0.1 and the
+    Allegro damping 0.1. Frictionless, inertia-free rotors let the position
+    actuators spin a joint arbitrarily fast: measured, random actions drove
+    joint velocities to 160 rad/s -- about 25 revolutions a second -- which is
+    what produced "Nan, Inf or huge value in QACC" during training. Real
+    harmonic-drive arms have substantial reflected rotor inertia, so supplying
+    it is the accurate choice as well as the stable one. Raising it to 0.1 caps
+    the same test at 30 rad/s.
+    """
+    for joint in spec.joints:
+        if joint.type != mujoco.mjtJoint.mjJNT_HINGE:
+            continue
+        joint.armature = max(float(joint.armature), armature)
+        # damping is a per-DOF array in mjSpec even for a hinge; only the first
+        # entry is meaningful for a one-DOF joint.
+        current = np.atleast_1d(np.asarray(joint.damping, dtype=float))
+        current[0] = max(current[0], damping)
+        joint.damping = current
+
+
 def _set_contact_options(spec: mujoco.MjSpec, impratio: float) -> None:
     """Match the Allegro's contact settings so attaching does not warn."""
     spec.option.impratio = impratio
@@ -158,6 +185,7 @@ def _build_arm(
     # The parent's option block wins on attach, so the arm must already agree
     # with the hand's elliptic-cone settings or the grasp contacts degrade.
     _set_contact_options(arm, impratio)
+    _ensure_joint_inertia(arm, ARM_ARMATURE, ARM_DAMPING)
     frame = arm.attach(hand, prefix=hand_prefix, site=site)
     frame.pos = [0.0, 0.0, mount_offset]
     return arm

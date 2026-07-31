@@ -100,6 +100,13 @@ class EnvConfig:
     # --- failure ---
     drop_height: float = 0.25
 
+    # Truncate if a joint runs away. The Isaac baseline had the same guard on
+    # end-effector velocity. It is a safety net rather than a fix -- joint
+    # armature is what actually keeps velocities sane -- but it stops a diverging
+    # episode from poisoning a rollout, and makes runaways visible in the logs
+    # instead of only as a MuJoCo warning on stderr.
+    max_joint_velocity: float = 25.0
+
     # --- reward weights ---
     # These three are set against each other deliberately. The progress term
     # telescopes to w_progress * delta_f, so it is the ENTIRE budget for doing
@@ -946,6 +953,10 @@ class HandoverEnv(gym.Env):
 
         obj_pos, _ = self._object_pose()
         dropped = bool(obj_pos[2] < self.cfg.drop_height)
+        runaway = bool(
+            np.abs(self.data.qvel).max() > self.cfg.max_joint_velocity
+            or not np.isfinite(self.data.qvel).all()
+        )
 
         if self._success(wrenches, fraction):
             self._hold_count += 1
@@ -959,7 +970,7 @@ class HandoverEnv(gym.Env):
             reward -= self.cfg.w_drop
 
         terminated = bool(held or dropped)
-        truncated = bool(self._step_count >= self.cfg.episode_steps)
+        truncated = bool(self._step_count >= self.cfg.episode_steps or runaway)
 
         self._prev_fraction = fraction
 
@@ -976,6 +987,8 @@ class HandoverEnv(gym.Env):
             "approach_rot": self.approach_error()[2],
             "success": bool(held),
             "dropped": dropped,
+            "runaway": runaway,
+            "max_qvel": float(np.abs(self.data.qvel).max()),
             "hold_count": self._hold_count,
             **terms,
         }
