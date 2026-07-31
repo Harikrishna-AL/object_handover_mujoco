@@ -56,6 +56,8 @@ class SceneConfig:
     # makes the scalar load-split metric ambiguous against a pure moment (D4).
     # The diameter must exceed the Allegro's 4.9 cm minimum grip opening or the
     # fingers close on empty air and never generate force.
+    # "cylinder" for the load-transfer task, "box" to match the reference prism.
+    obj_shape: str = "cylinder"
     obj_radius: float = 0.030
     # 22 cm long. Length is not cosmetic: the giver grips off-centre and the
     # receiver takes the far end, so the rod's length IS the clearance between
@@ -284,10 +286,16 @@ def _add_object(world: mujoco.MjSpec, cfg: SceneConfig) -> None:
         name="object", pos=list(cfg.obj_init_pos), quat=list(cfg.obj_quat)
     )
     obj.add_freejoint(name="object_free")
+    if cfg.obj_shape == "box":
+        geom_type = mujoco.mjtGeom.mjGEOM_BOX
+        size = [cfg.obj_radius, cfg.obj_radius, cfg.obj_half_length]
+    else:
+        geom_type = mujoco.mjtGeom.mjGEOM_CYLINDER
+        size = [cfg.obj_radius, cfg.obj_half_length, 0.0]
     obj.add_geom(
         name="object_geom",
-        type=mujoco.mjtGeom.mjGEOM_CYLINDER,
-        size=[cfg.obj_radius, cfg.obj_half_length, 0.0],
+        type=geom_type,
+        size=size,
         mass=cfg.obj_mass,
         friction=list(cfg.obj_friction),
         rgba=[0.15, 0.7, 0.25, 1.0],

@@ -25,7 +25,11 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor, VecNormalize
 
+from dataclasses import replace as _replace
+
+from handover.baseline import baseline_env_overrides, baseline_scene_overrides
 from handover.env import DomainRandomization, EnvConfig, HandoverEnv
+from handover.scene import SceneConfig
 
 
 # Optional reward terms, mirroring the Isaac flag names so runs stay comparable.
@@ -62,10 +66,11 @@ def env_config_from_args(args, giver_mode: str) -> EnvConfig:
     return EnvConfig(giver_mode=giver_mode, **overrides)
 
 
-def make_env(seed: int, randomize: bool, env_cfg: EnvConfig):
+def make_env(seed: int, randomize: bool, env_cfg: EnvConfig, scene_cfg: SceneConfig):
     def _init():
         env = HandoverEnv(
             env_cfg,
+            scene_cfg=scene_cfg,
             randomization=DomainRandomization(enabled=randomize),
             seed=seed,
         )
@@ -136,6 +141,9 @@ def main():
     ap.add_argument("--batch-size", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--checkpoint-every", type=int, default=200_000)
+    ap.add_argument("--task-mode", choices=["transfer", "baseline"], default="transfer",
+                    help="'baseline' reproduces the Isaac reference task: 0.25 g prism, "
+                         "two-phase reward, success when the object reaches the target")
     ap.add_argument("--giver-mode", choices=["policy", "scripted"], default="scripted",
                     help="stage 1 uses 'scripted'; stage 2 unfreezes the giver")
     ap.add_argument("--init-from", type=str, default=None,
@@ -150,6 +158,14 @@ def main():
     args = ap.parse_args()
 
     env_cfg = env_config_from_args(args, args.giver_mode)
+    scene_cfg = SceneConfig()
+    if args.task_mode == "baseline":
+        env_cfg = _replace(env_cfg, **baseline_env_overrides())
+        scene_cfg = _replace(scene_cfg, **baseline_scene_overrides())
+        print("task: BASELINE -- reproducing the Isaac reference "
+              "(0.25 g prism, two-phase reward, target-pose success)")
+    else:
+        print("task: transfer -- force-mediated load transfer")
     active = [f for f in REWARD_FLAGS if getattr(args, f)]
     reward_label = "baseline" if not active else "baseline+" + "+".join(active)
     print("reward: baseline" + (f" + {', '.join(active)}" if active else " only (no flags)"))
@@ -169,6 +185,7 @@ def main():
             config={
                 **vars(args),
                 "reward_label": reward_label,
+                "task_mode": args.task_mode,
                 "active_reward_flags": active,
             },
             sync_tensorboard=True,
@@ -178,7 +195,8 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     venv = SubprocVecEnv(
-        [make_env(args.seed + i, not args.no_dr, env_cfg) for i in range(args.n_envs)],
+        [make_env(args.seed + i, not args.no_dr, env_cfg, scene_cfg)
+         for i in range(args.n_envs)],
         start_method="spawn",
     )
     venv = VecMonitor(venv)

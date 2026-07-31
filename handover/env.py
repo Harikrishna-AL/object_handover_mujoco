@@ -29,6 +29,7 @@ import mujoco
 import numpy as np
 from gymnasium import spaces
 
+from .baseline import BaselineReward
 from .contacts import GIVER, RECV, ContactRegistry, load_fraction
 from .dq import pose_distance
 from .control import BimanualController, ControlConfig
@@ -235,6 +236,19 @@ class EnvConfig:
     # starts charging for it once the receiver has clearly taken the load.
     deadlock_after_fraction: float = 0.5
 
+    # "transfer" is the force-mediated load-transfer task this project is about.
+    # "baseline" reproduces the Isaac reference: near-weightless prism, two-phase
+    # dual-quaternion reward, success when the object reaches a target pose.
+    task_mode: str = "transfer"
+
+    # Reference target, expressed in the receiver's base frame, and the x
+    # threshold its success test uses (obj_pose[:, 0] < 0.05).
+    baseline_target: tuple[float, float, float] = (0.1054, -0.0250, 0.5662)
+    baseline_success_x: float = 0.05
+    # Contact needed before the giver is told to let go, standing in for the
+    # reference's thumb-plus-fingers latch.
+    baseline_grasp_force: float = 0.02
+
     # --- curriculum ---
     # "policy"   : the giver is controlled by the policy. The final task.
     # "scripted" : the giver holds, then opens once the receiver has taken hold.
@@ -378,6 +392,9 @@ class HandoverEnv(gym.Env):
         self._prev_fraction = 0.0
         self._prev_potential = 0.0
         self._f_smooth = 0.0
+        self._grasped = False
+        self._baseline_reward = BaselineReward()
+        self._prev_hand_obj = np.inf
         self._prev_contacts = {GIVER: 0, RECV: 0}
         self._prev_grip = {GIVER: 0.0, RECV: 0.0}
 
@@ -644,7 +661,60 @@ class HandoverEnv(gym.Env):
         )
         return float(np.linalg.norm(vel[3:6]))
 
+    def _object_in_recv_frame(self) -> np.ndarray:
+        """Object position expressed in the receiver's base frame.
+
+        The reference's success test is on this frame's x coordinate, so the
+        comparison only holds if we measure it the same way.
+        """
+        base_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"{RECV}_base_link")
+        base_pos = self.data.xpos[base_id]
+        mat = self.data.xmat[base_id].reshape(3, 3)
+        obj_pos, _ = self._object_pose()
+        return mat.T @ (obj_pos - base_pos)
+
+    def _baseline_terms(self, wrenches) -> tuple[float, dict]:
+        """Reference two-phase reward: approach the object, then carry it home."""
+        cfg = self.cfg
+        hand_obj = self.approach_error()[0]
+
+        local = self._object_in_recv_frame()
+        target = np.asarray(cfg.baseline_target, dtype=float)
+        obj_target = float(np.linalg.norm(local - target))
+
+        # The reference gates the approach term on closing distance (its `mod`)
+        # and on coming in pocket-first rather than knuckles-first (`pre_mod`).
+        approaching = hand_obj < self._prev_hand_obj
+        obj_pos, _ = self._object_pose()
+        palm_pos, _ = self.controller.arms[RECV].palm_pose(self.data)
+        palm_leading = float(np.linalg.norm(self._grip_point(RECV) - obj_pos)) < float(
+            np.linalg.norm(palm_pos - obj_pos)
+        )
+        self._prev_hand_obj = hand_obj
+
+        was_grasped = self._grasped
+        self._grasped = self._grasped or wrenches[RECV].grip > cfg.baseline_grasp_force
+        just_grasped = self._grasped and not was_grasped
+        reached = bool(local[0] < cfg.baseline_success_x)
+
+        total, terms = self._baseline_reward(
+            hand_obj_dist=hand_obj,
+            obj_target_dist=obj_target,
+            approaching=approaching,
+            palm_leading=palm_leading,
+            grasped=self._grasped,
+            just_grasped=just_grasped,
+            reached_target=reached,
+            wrench=wrenches[RECV],
+        )
+        terms["baseline_obj_target_dist"] = obj_target
+        terms["baseline_grasped"] = float(self._grasped)
+        return total, terms
+
     def _reward(self, wrenches, fraction: float) -> tuple[float, dict]:
+        if self.cfg.task_mode == "baseline":
+            return self._baseline_terms(wrenches)
+
         """Baseline reward, plus whatever optional terms are switched on.
 
         Structured the same way as the Isaac environment: everything outside the
@@ -754,6 +824,12 @@ class HandoverEnv(gym.Env):
 
     def _success(self, wrenches, fraction: float) -> bool:
         obj_pos, _ = self._object_pose()
+        if self.cfg.task_mode == "baseline":
+            # Reference test: the object has been brought to the receiver's side.
+            return bool(
+                self._object_in_recv_frame()[0] < self.cfg.baseline_success_x
+                and obj_pos[2] > self.cfg.drop_height
+            )
         return bool(
             fraction >= self.cfg.success_load_fraction
             and abs(wrenches[GIVER].load_vertical) <= self.cfg.success_giver_force
@@ -824,19 +900,27 @@ class HandoverEnv(gym.Env):
             "giver_quat": np.asarray(scene.giver_start_quat, dtype=float),
         }
 
-    def _apply_object_params(self, radius: float, half_length: float, mass: float) -> None:
+    def _apply_object_params(self, radius: float, half_length: float, mass: float) -> None:  # noqa: D401
         """Resize and re-mass the object.
 
         Geometry is baked at compile time, so mass and inertia do not follow a
         size change automatically -- they have to be recomputed or the object
         keeps the inertia of whatever it used to be.
         """
+        box = self.scene_cfg.obj_shape == "box"
         self.model.geom_size[self.object_geom, 0] = radius
-        self.model.geom_size[self.object_geom, 1] = half_length
+        self.model.geom_size[self.object_geom, 1] = radius if box else half_length
+        if box:
+            self.model.geom_size[self.object_geom, 2] = half_length
         self.model.body_mass[self.object_body] = mass
-        # Solid cylinder about its own axis (local z) and the two transverse axes.
-        transverse = mass * (3.0 * radius**2 + 4.0 * half_length**2) / 12.0
-        axial = 0.5 * mass * radius**2
+        if box:
+            # Solid cuboid with half-extents (radius, radius, half_length).
+            transverse = mass * (radius**2 + half_length**2) / 3.0
+            axial = mass * (radius**2 + radius**2) / 3.0
+        else:
+            # Solid cylinder about its own axis (local z) and the transverse axes.
+            transverse = mass * (3.0 * radius**2 + 4.0 * half_length**2) / 12.0
+            axial = 0.5 * mass * radius**2
         self.model.body_inertia[self.object_body] = [transverse, transverse, axial]
         self._nominal["mass"] = mass
 
@@ -940,6 +1024,8 @@ class HandoverEnv(gym.Env):
         self._prev_fraction = load_fraction(wrenches, self.weight)
         self._prev_potential = self._potential(self._object_pose()[0])
         self._f_smooth = 0.0
+        self._grasped = False
+        self._prev_hand_obj = self.approach_error()[0]
         for side, w in wrenches.items():
             self._prev_contacts[side] = w.n_contacts
             self._prev_grip[side] = w.grip
@@ -957,8 +1043,15 @@ class HandoverEnv(gym.Env):
         wrenches = self.registry.hand_wrenches(self.data)
         parts = self.controller.split(action)
         giver = np.zeros_like(parts[GIVER])
-        # Hold still, then release once the receiver has a real grip on it.
-        giver[6] = -1.0 if wrenches[RECV].grip > self.cfg.scripted_release_grip else 0.0
+        # Hold still, then release once the receiver has a real grip on it. The
+        # reference latches on a much smaller force because its object weighs a
+        # quarter of a gram.
+        threshold = (
+            self.cfg.baseline_grasp_force
+            if self.cfg.task_mode == "baseline"
+            else self.cfg.scripted_release_grip
+        )
+        giver[6] = -1.0 if wrenches[RECV].grip > threshold else 0.0
         return np.concatenate([giver, parts[RECV]])
 
     def step(self, action):
