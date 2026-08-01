@@ -193,6 +193,28 @@ headless node try `MUJOCO_GL=egl`, and if the build lacks EGL just record
 locally -- nothing in training renders, so this is a debugging tool rather than
 part of a run.
 
+## Comparing against the reference
+
+`--task-mode baseline` reproduces the Isaac reference task (0.25 g prism,
+two-phase reward, target-pose success) so a result here can be set beside the
+published one. `--task-mode transfer` is the load-transfer task this project is
+about. Object mass is a flag, because it is the parameter that separates them.
+
+```bash
+bash slurm/compare.sh --dry-run     # inspect
+bash slurm/compare.sh               # baseline + transfer at 50 g and 200 g, 3 seeds each
+```
+
+Run the baseline alone first and confirm it produces successes before spending
+the cluster on the rest.
+
+Measured, so the ladder is grounded rather than guessed: the giver holds
+anything up to 200 g at 99% of its weight and fails by 400 g. Lighter is more
+forgiving (50 g gives 14 contacts against 9 at 200 g) while keeping load
+fraction meaningful. Below about 10 g the measurement itself stops meaning
+anything -- `f = F/mg` divides by almost nothing, which is why
+`peak_load_fraction` reads 70-100 in baseline mode and should be ignored there.
+
 ## Reading a finished run
 
 Everything the training script prints is also written to the run directory, so

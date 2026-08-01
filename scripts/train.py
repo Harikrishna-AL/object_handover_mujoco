@@ -141,6 +141,12 @@ def main():
     ap.add_argument("--batch-size", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--checkpoint-every", type=int, default=200_000)
+    ap.add_argument("--obj-mass", type=float, default=None,
+                    help="object mass in kg. The giver holds anything up to ~200 g at "
+                         "99%% of its weight and fails by 400 g; lighter is more "
+                         "forgiving (50 g gives 14 contacts against 9 at 200 g) while "
+                         "keeping load fraction meaningful. Ignored in baseline mode, "
+                         "which pins the reference's 0.25 g.")
     ap.add_argument("--task-mode", choices=["transfer", "baseline"], default="transfer",
                     help="'baseline' reproduces the Isaac reference task: 0.25 g prism, "
                          "two-phase reward, success when the object reaches the target")
@@ -165,7 +171,10 @@ def main():
         print("task: BASELINE -- reproducing the Isaac reference "
               "(0.25 g prism, two-phase reward, target-pose success)")
     else:
-        print("task: transfer -- force-mediated load transfer")
+        if args.obj_mass is not None:
+            scene_cfg = _replace(scene_cfg, obj_mass=args.obj_mass)
+        print(f"task: transfer -- force-mediated load transfer, "
+              f"object {1000 * scene_cfg.obj_mass:.0f} g")
     active = [f for f in REWARD_FLAGS if getattr(args, f)]
     reward_label = "baseline" if not active else "baseline+" + "+".join(active)
     print("reward: baseline" + (f" + {', '.join(active)}" if active else " only (no flags)"))
@@ -186,6 +195,7 @@ def main():
                 **vars(args),
                 "reward_label": reward_label,
                 "task_mode": args.task_mode,
+                "obj_mass": scene_cfg.obj_mass,
                 "active_reward_flags": active,
             },
             sync_tensorboard=True,
