@@ -23,17 +23,20 @@
 set -euo pipefail
 
 # ---- edit these for your cluster -------------------------------------------
-PROJECT_DIR="${PROJECT_DIR:-$HOME/bimanual_handover_mj}"
+# Barnard: /home has a 50 GB quota that this project blew through, so both the
+# venv and Menagerie live in the workspace instead (`ws_find handover`).
+PROJECT_DIR="${PROJECT_DIR:-/data/horse/ws/hapi039h-handover/bimanual_handover_mj}"
 VENV="${VENV:-$PROJECT_DIR/.venv}"
-export MUJOCO_MENAGERIE="${MUJOCO_MENAGERIE:-$HOME/mujoco_menagerie}"
+export MUJOCO_MENAGERIE="${MUJOCO_MENAGERIE:-/data/horse/ws/hapi039h-handover/mujoco_menagerie}"
 TIMESTEPS="${TIMESTEPS:-20000000}"
 GIVER_MODE="${GIVER_MODE:-scripted}"
 # ----------------------------------------------------------------------------
 
-# Compute nodes do not inherit login-shell modules. If you needed a module to
-# get Python 3.10+ interactively, uncomment and set it here or the job will die
-# at `import mujoco`.
-# module load Python/3.11.3
+# Compute nodes do not inherit login-shell modules -- without this the job
+# queues, starts, and dies at `import mujoco` on a stale Python 3.9. This is
+# the exact sequence confirmed interactively (python3 -V -> 3.11.3).
+module load development/24.04 GCCcore/12.3.0
+module load Python/3.11.3
 
 cd "$PROJECT_DIR"
 mkdir -p slurm_logs runs
