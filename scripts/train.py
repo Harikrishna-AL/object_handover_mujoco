@@ -228,11 +228,34 @@ def main():
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.005,
+        # ent_coef 0 rather than 0.005: with a plain (non-squashed) Gaussian and
+        # an ent_coef > 0, PPO has a free lunch. The environment clips sampled
+        # actions to [-1, 1] AFTER sampling, so that clip is invisible to the
+        # loss; growing std costs nothing once samples saturate, but it directly
+        # increases entropy and lowers the loss via -ent_coef * entropy. Measured
+        # on a real 15M-step run: std climbed 1.02 -> 1.13 -> 1.36 -> 227,
+        # approx_kl hit 0.12 (target ~0.01-0.02), clip_fraction 0.33 -- the
+        # policy was rewarded for turning into noise, and closest_approach_m
+        # stayed flat the entire run because there was no controlled motion left
+        # to learn from.
+        #
+        # SB3 only permits squash_output (a real tanh bound instead of a
+        # post-hoc clip) together with gSDE, so both are enabled here: gSDE
+        # provides the exploration ent_coef was doing badly, and the tanh squash
+        # makes "grow std for free" structurally impossible since bounded
+        # actions have bounded, correctly-priced entropy.
+        ent_coef=0.0,
+        use_sde=True,
+        sde_sample_freq=4,
         vf_coef=0.5,
         max_grad_norm=0.5,
         n_epochs=10,
-        policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])),
+        # Extra safety net: halts a PPO epoch early if an update still moves the
+        # policy further than this, regardless of the fix above.
+        target_kl=0.02,
+        policy_kwargs=dict(
+            net_arch=dict(pi=[256, 256], vf=[256, 256]), squash_output=True
+        ),
         seed=args.seed,
         verbose=1,
         tensorboard_log=args.out,
