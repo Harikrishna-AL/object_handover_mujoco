@@ -17,7 +17,9 @@ import os
 import sys
 
 # Metrics worth seeing, in the order they answer questions:
-# is it reaching, is it holding, is it dropping, is it scoring.
+# is it reaching, is it holding, is it dropping, is it scoring, and -- because a
+# reward curve looks identical whether the policy is learning or just turning
+# into noise -- is the policy itself still sane.
 KEYS = [
     "handover/closest_approach_m",
     "handover/peak_load_fraction",
@@ -25,6 +27,9 @@ KEYS = [
     "handover/success_rate",
     "rollout/ep_len_mean",
     "rollout/ep_rew_mean",
+    "train/std",
+    "train/approx_kl",
+    "train/clip_fraction",
 ]
 SHORT = {
     "handover/closest_approach_m": "approach",
@@ -33,7 +38,16 @@ SHORT = {
     "handover/success_rate": "success",
     "rollout/ep_len_mean": "ep_len",
     "rollout/ep_rew_mean": "ep_rew",
+    "train/std": "std",
+    "train/approx_kl": "kl",
+    "train/clip_fraction": "clipfrac",
 }
+
+# std should sit near 1 and NOT trend upward; approx_kl should sit near the
+# target_kl passed to PPO (0.02 in this project). Past these, the policy has
+# stopped doing anything resembling control -- see e2a9cfc.
+STD_WARN = 3.0
+KL_WARN = 0.05
 
 
 def find_runs(run_dir: str) -> list[str]:
@@ -99,13 +113,30 @@ def summarize(run_dir: str, rows: int) -> None:
 
     # First and last decile, which is what "did it improve" actually means.
     print("\n  " + f"{'':>10}" + "".join(f"{SHORT[k]:>12}" for k in present))
+    last_std = last_kl = None
     for label, sl in (("first 10%", slice(0, max(1, len(steps) // 10))),
                       ("last 10%", slice(-max(1, len(steps) // 10), None))):
         line = f"  {label:>10}"
         for key in present:
             chunk = [v for _, v in series[key][sl]]
-            line += f"{sum(chunk) / len(chunk):>12.3f}" if chunk else f"{'-':>12}"
+            avg = sum(chunk) / len(chunk) if chunk else None
+            line += f"{avg:>12.3f}" if avg is not None else f"{'-':>12}"
+            if label == "last 10%" and key == "train/std":
+                last_std = avg
+            if label == "last 10%" and key == "train/approx_kl":
+                last_kl = avg
         print(line)
+
+    # A reward curve looks the same whether the policy learned or dissolved
+    # into noise (see e2a9cfc), so call that out explicitly rather than making
+    # every reader re-derive it from a wall of numbers.
+    if last_std is not None and last_std > STD_WARN:
+        print(f"\n  !! std = {last_std:.1f} at the end of training (want ~1) -- "
+              f"the policy has likely collapsed into noise; treat success/reward "
+              f"numbers above as untrustworthy.")
+    elif last_kl is not None and last_kl > KL_WARN:
+        print(f"\n  !! approx_kl = {last_kl:.3f} at the end of training (target ~0.02) "
+              f"-- updates are unstable; check std too.")
 
 
 def main():
